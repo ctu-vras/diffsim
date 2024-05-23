@@ -1,0 +1,87 @@
+import torch
+import warp as wp
+import numpy as np
+from copy import deepcopy
+from time import time
+import matplotlib.pyplot as plt
+from data_transforms import parse_csv_traj, parse_csv_control
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
+from DiffSim import DiffSim
+
+wp.init()  # init warp!
+
+num_robots = 1
+device = "cpu"
+use_cuda_graph = False
+
+# setup heigtmaps for the simulator using torch tensors
+shp = (30, 20)
+torch_hm = [torch.zeros(shp, dtype=torch.float32, device=device, requires_grad=True) for _ in range(num_robots)]
+torch_kf = [torch.tensor(0.5 * np.ones(shp), dtype=torch.float32, device=device, requires_grad=True) for _ in range(num_robots)]
+res = [0.2 for _ in range(num_robots)]  # heightmap resolutions
+
+# instantiate simulator and set the simulated time horizon
+simulator = DiffSim(torch_hm, torch_kf, res, use_renderer=True, device=device)
+T_s = 300  # duration of a trajectory fragment used for optimization
+simulator.set_T(5000, T_s=T_s)
+
+# define target poses with timesteps for each robot
+num_poses = 30
+poses0 = np.zeros((num_poses, 7))
+poses0[:, 6] = 1  # quaternion w
+poses0[:, 0] = np.arange(num_poses)/num_poses*1 # x coordinate
+# poses0[:, 2] = 1.0 + np.arange(num_poses)/num_poses*0.1 # z coordinate
+poses0[:, 2] = 1.0
+timesteps0 = (simulator.T * np.arange(num_poses)/num_poses).astype(int)
+poses = [poses0[:] for _ in range(num_robots)]
+timesteps = [timesteps0[:] for _ in range(num_robots)]
+
+# define control input for each robot
+controls0 = 0.2*np.ones((simulator.T, num_robots, 2))
+flipper_angles0 = np.zeros((simulator.T, num_robots, 4))
+controls = [controls0[:] for _ in range(num_robots)]
+flipper_angles = [flipper_angles0[:] for _ in range(num_robots)]
+
+print('setting ground truth trajectories')
+simulator.render_heightmaps()
+simulator.set_target_poses(timesteps, poses)
+simulator.render_traj(poses0[:, :3])
+
+print('setting controls')
+simulator.set_control(controls, flipper_angles)
+
+Laplacian_kernel = torch.tensor([[[[-1,-1,-1],[-1,8,-1],[-1,-1,-1]]]]).to(device)/8
+
+sgd_iters = 2000
+heightmap_opt = torch.optim.SGD(torch_hm + torch_kf, lr=0.01)
+
+last_valid = None
+for i in range(sgd_iters):
+    simulator.init_shoot_states()  # load initial states for the shooter
+
+    start = time()
+    body_q, loss = simulator.simulate_and_backward(use_graph=use_cuda_graph)
+    simulator.render_states('current', color=(1.0, 0.0, 0.0))
+    simulator.render_heightmaps()
+    simulator.render_simulation(pause=False)
+    print('sim time: ', time() - start)
+
+    print('loss: ', loss.numpy())
+    # for robot_idx in range(num_robots):
+    #     print('heightmap grad norm: ', torch_hm[robot_idx].grad.norm().cpu().numpy())
+    #
+    #     second_derivatives = 1 * torch.nn.functional.conv2d(torch_hm[robot_idx].unsqueeze(0).unsqueeze(0),
+    #                                                            Laplacian_kernel, padding=1).square().sum()
+    #     print('second derivative', second_derivatives.detach().cpu().numpy())
+    #     second_derivatives.backward()  # add a second derivative term to the loss
+
+    heightmap_opt.step()
+    heightmap_opt.zero_grad(set_to_none=False)  # necessary, since tape.zero() does not reach the torch tensor for some reason
+
+    if i % 20 == 0:
+        print('iter', i)
+        simulator.save_shoot_init_vels()  # save states for shooter
+        simulator.simulate_single()  # simulate a single long trajectory for testing
+        simulator.render_states('current', color=(1.0, 0.0, 0.0))
+        simulator.render_simulation(pause=False)
