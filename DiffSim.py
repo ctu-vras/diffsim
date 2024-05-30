@@ -2,9 +2,10 @@ import numpy as np
 from heightmap import Heightmap, eval_heightmap_collisions_shoot
 import warp as wp
 import warp.sim.render
-from vis import get_heightmap_vis_ids, generate_force_vis, traj_to_line, states_to_line
-from data_transforms import control_to_numpy, flipper_angles_to_numpy, combine_transforms
+from vis import get_heightmap_vis_ids, generate_force_vis
+from data_transforms import combine_transforms
 from scipy.spatial.transform import Rotation as R
+from TerrainEncoder import LiftSplatShoot
 
 
 import sys
@@ -155,6 +156,10 @@ class DiffSim:
     dt = 0.001
     renderer = None
 
+    ke = 1.0e4
+    kd = 150.0
+    kf = 0.5
+
     forward_backward_graph = None
     forward_graph = None
 
@@ -175,9 +180,9 @@ class DiffSim:
 
     rendering_state = None
 
-    def __init__(self, torch_hms, torch_kfs, res, use_renderer=False, device="cpu"):
+    def __init__(self, cam_data_list, terrain_encoder_cfg, use_renderer=False, device="cpu"):
         # instantiate a tracked robot model consisting of a box and collision points
-        self.sim_robots = len(torch_hms)  # number of simulated robots is based on number of heightmaps
+        self.sim_robots = len(cam_data_list[0])  # number of simulated robots is based on number of heightmaps
         self.vis_robots = min(self.sim_robots, 4)
 
         self.device = device
@@ -185,25 +190,11 @@ class DiffSim:
 
         self.loss = wp.zeros(1, dtype=wp.float32, device=self.device, requires_grad=True)
 
-        self.heightmap_list = []
-        for robot_idx in range(self.sim_robots):
-            current_hm = torch_hms[robot_idx]
-            current_kf = torch_kfs[robot_idx]
-            current_res = res[robot_idx]
+        self.terrain_encoder_cfg = terrain_encoder_cfg
+        self.terrain_encoder = self.build_terrain_encoder(terrain_encoder_cfg)
 
-            current_shp = current_hm.shape
-
-            current_heightmap = Heightmap()
-            current_heightmap.heights = wp.from_torch(current_hm, requires_grad=True)
-            current_heightmap.ke = wp.array(1.0e4 * np.ones(current_shp), dtype=wp.float32, device=self.device, requires_grad=True)
-            current_heightmap.kd = wp.array(150.0 * np.ones(current_shp), dtype=wp.float32, device=self.device, requires_grad=True)
-            current_heightmap.kf = wp.from_torch(current_kf)
-            current_heightmap.origin = (-current_shp[0] * current_res / 2, -current_shp[1] * current_res / 2, 0.75)
-            current_heightmap.resolution = current_res
-            current_heightmap.width = current_shp[0]
-            current_heightmap.length = current_shp[1]
-
-            self.heightmap_list.append(current_heightmap)
+        self.cam_data_list = cam_data_list
+        self.heightmap_list = self.init_heightmaps()
         self.heightmap_array = wp.array(self.heightmap_list, dtype=Heightmap, device=self.device)
 
         self.heightmap_vis_indices = []
@@ -228,6 +219,47 @@ class DiffSim:
             # allocate rendering state for n robots and 4 flippers of the first robot
             self.rendering_state = RenderingState()
             self.rendering_state.body_q = wp.zeros((self.vis_robots + 4), dtype=wp.transformf, device=self.device, requires_grad=False)
+
+    def build_terrain_encoder(self, lss_cfg):
+        terrain_encoder = LiftSplatShoot(grid_conf=lss_cfg['grid_conf'],
+                                         data_aug_conf=lss_cfg['data_aug_conf'],
+                                         inpC=3, outC=1).to(self.device)
+        terrain_encoder.train()
+        return terrain_encoder
+
+    def init_heightmaps(self):
+        x_bound = self.terrain_encoder_cfg['grid_conf']['xbound']
+        y_bound = self.terrain_encoder_cfg['grid_conf']['ybound']
+        grid_res = x_bound[2]
+        assert x_bound[2] == y_bound[2], "x and y resolution must be equal"
+
+        hm_shape = (int((x_bound[1] - x_bound[0]) / grid_res),
+                    int((y_bound[1] - y_bound[0]) / grid_res))
+        heightmap_list = []
+        for robot_idx in range(self.sim_robots):
+            current_res = grid_res
+
+            current_heightmap = Heightmap()
+            current_heightmap.heights = wp.array(np.zeros(hm_shape), dtype=wp.float32, device=self.device)
+            current_heightmap.ke = wp.array(self.ke * np.ones(hm_shape), dtype=wp.float32, device=self.device)
+            current_heightmap.kd = wp.array(self.kd * np.ones(hm_shape), dtype=wp.float32, device=self.device)
+            current_heightmap.kf = wp.array(self.kf * np.ones(hm_shape), dtype=wp.float32, device=self.device)
+            current_heightmap.origin = (-hm_shape[0] * current_res / 2, -hm_shape[1] * current_res / 2, 0.75)
+            current_heightmap.resolution = current_res
+            current_heightmap.width = hm_shape[0]
+            current_heightmap.length = hm_shape[1]
+
+            heightmap_list.append(current_heightmap)
+        return heightmap_list
+
+    def predict_heightmaps(self):
+        heights_batch = self.terrain_encoder(*self.cam_data_list)
+        return heights_batch
+
+    def set_heightmaps(self, heights_batch):
+        for idx, height in enumerate(heights_batch):
+            self.heightmap_list[idx].heights.assign(height)
+        self.heightmap_array = wp.array(self.heightmap_list, dtype=Heightmap, device=self.device)
 
     def __del__(self):
         if self.renderer is not None:
