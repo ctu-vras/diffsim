@@ -1,9 +1,9 @@
 import numpy as np
-from heightmap import Heightmap, eval_heightmap_collisions_shoot
+from ..data.heightmap import Heightmap, eval_heightmap_collisions_shoot
 import warp as wp
 import warp.sim.render
-from vis import get_heightmap_vis_ids, generate_force_vis, traj_to_line, states_to_line
-from data_transforms import control_to_numpy, flipper_angles_to_numpy, combine_transforms
+from ..vis import get_heightmap_vis_ids, generate_force_vis
+from ..data.data_transforms import combine_transforms
 from scipy.spatial.transform import Rotation as R
 
 
@@ -228,12 +228,9 @@ class DiffSim:
 
             current_heightmap = Heightmap()
             current_heightmap.heights = wp.from_torch(current_hm)
-            current_heightmap.ke = wp.array(self.ke * np.ones(current_shp), dtype=wp.float32, device=self.device,
-                                            requires_grad=True)
-            current_heightmap.kd = wp.array(self.kd * np.ones(current_shp), dtype=wp.float32, device=self.device,
-                                            requires_grad=True)
-            current_heightmap.kf = wp.array(self.kf * np.ones(current_shp), dtype=wp.float32, device=self.device,
-                                            requires_grad=True)
+            current_heightmap.ke = wp.array(self.ke * np.ones(current_shp), dtype=wp.float32, device=self.device)
+            current_heightmap.kd = wp.array(self.kd * np.ones(current_shp), dtype=wp.float32, device=self.device)
+            current_heightmap.kf = wp.array(self.kf * np.ones(current_shp), dtype=wp.float32, device=self.device)
             current_heightmap.origin = (-current_shp[0] * current_res / 2, -current_shp[1] * current_res / 2, 0.75)
             current_heightmap.resolution = current_res
             current_heightmap.width = current_shp[0]

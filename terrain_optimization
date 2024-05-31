@@ -1,0 +1,198 @@
+#! /usr/bin/env python
+
+import torch
+import warp as wp
+import numpy as np
+import os
+from PIL import Image
+import yaml
+from src.utils import sample_augmentation, img_transform, normalize_img, load_calib
+from src.models.DiffSim import DiffSim
+from src.models.TerrainEncoder import compile_model
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+wp.init()  # init warp!
+
+
+def read_yaml(path):
+    with open(path, 'r') as f:
+        data = yaml.load(f, Loader=yaml.Loader)
+    return data
+
+
+def get_cam_data(img_paths, cameras, calib_path, terrain_encoder_cfg, device='cuda'):
+    imgs = []
+    rots = []
+    trans = []
+    post_rots = []
+    post_trans = []
+    intrins = []
+    calib = load_calib(calib_path)
+    for cam, img_path in zip(cameras, img_paths):
+        img = Image.open(img_path)
+        K = calib[cam]['camera_matrix']['data']
+        K = np.asarray(K, dtype=np.float32).reshape((3, 3))
+        post_rot = torch.eye(2)
+        post_tran = torch.zeros(2)
+        # augmentation (resize, crop, horizontal flip, rotate)
+        resize, resize_dims, crop, flip, rotate = sample_augmentation(terrain_encoder_cfg)
+        img, post_rot2, post_tran2 = img_transform(img, post_rot, post_tran,
+                                                   resize=resize,
+                                                   resize_dims=resize_dims,
+                                                   crop=crop,
+                                                   flip=flip,
+                                                   rotate=rotate)
+        # for convenience, make augmentation matrices 3x3
+        post_tran = torch.zeros(3)
+        post_rot = torch.eye(3)
+        post_tran[:2] = post_tran2
+        post_rot[:2, :2] = post_rot2
+        # rgb and intrinsics
+        img = normalize_img(img)
+        K = torch.as_tensor(K)
+        # extrinsics
+        T_robot_cam = calib['transformations'][f'T_base_link__{cam}']['data']
+        T_robot_cam = np.asarray(T_robot_cam, dtype=np.float32).reshape((4, 4))
+        rot = torch.as_tensor(T_robot_cam[:3, :3])
+        tran = torch.as_tensor(T_robot_cam[:3, 3])
+        imgs.append(img)
+        rots.append(rot)
+        trans.append(tran)
+        intrins.append(K)
+        post_rots.append(post_rot)
+        post_trans.append(post_tran)
+    cam_data = [torch.stack(imgs), torch.stack(rots), torch.stack(trans),
+                torch.stack(intrins), torch.stack(post_rots), torch.stack(post_trans)]
+    cam_data = [torch.as_tensor(i[None], dtype=torch.float32, device=device) for i in cam_data]
+
+    return cam_data
+
+
+def get_gt_trajectory(num_robots, T_horizon):
+    # define target poses with timestamps for each robot
+    num_poses = 30
+    poses0 = np.zeros((num_poses, 7))
+    poses0[:, 6] = 1  # quaternion w
+    poses0[:, 0] = np.arange(num_poses) / num_poses * 1  # x coordinate
+    poses0[:, 2] = 1.0
+    timesteps0 = (T_horizon * np.arange(num_poses) / num_poses).astype(int)
+    poses = [poses0[:] for _ in range(num_robots)]
+    timesteps = [timesteps0[:] for _ in range(num_robots)]
+
+    return timesteps, poses
+
+def get_control_inputs(num_robots, T_horizon):
+    # define control input for each robot
+    controls0 = 0.2 * np.ones((T_horizon, num_robots, 2))
+    flipper_angles0 = np.zeros((T_horizon, num_robots, 4))
+    controls = [controls0[:] for _ in range(num_robots)]
+    flipper_angles = [flipper_angles0[:] for _ in range(num_robots)]
+
+    return controls, flipper_angles
+
+
+class Learner:
+    def __init__(self, num_robots, terrain_encoder_cfg, device='cuda', use_renderer=False):
+        self.device = device
+        self.use_cuda_graph = True if device == 'cuda' else False
+        self.use_renderer = use_renderer
+        self.num_robots = num_robots
+
+        self.terrain_encoder_cfg = terrain_encoder_cfg
+        self.terrain_encoder = self.init_terrain_enccoder(terrain_encoder_cfg)
+
+        self.torch_hms, self.res = self.get_initial_heightmaps(num_robots=num_robots)
+        self.dphys = self.init_diff_physics(self.torch_hms, self.res)
+
+    def init_terrain_enccoder(self, terrain_encoder_cfg):
+        terrain_encoder = compile_model(terrain_encoder_cfg['grid_conf'], terrain_encoder_cfg['data_aug_conf'])
+        terrain_encoder.to(self.device)
+        terrain_encoder.train()
+        return terrain_encoder
+
+    def init_diff_physics(self, torch_hms, res):
+        dphys = DiffSim(torch_hms, res, use_renderer=self.use_renderer, device=self.device)
+        return dphys
+
+    def get_initial_heightmaps(self, num_robots):
+        xbound = self.terrain_encoder_cfg['grid_conf']['xbound']
+        ybound = self.terrain_encoder_cfg['grid_conf']['ybound']
+        grid_res = xbound[2]
+        shp = (int((xbound[1] - xbound[0]) / grid_res), int((ybound[1] - ybound[0]) / grid_res))
+        torch_hms = [torch.zeros(shp, dtype=torch.float32, device=self.device, requires_grad=True)
+                     for _ in range(num_robots)]
+        res = [grid_res for _ in range(num_robots)]  # heightmap resolutions
+        return torch_hms, res
+
+    def optimization(self, cam_data, n_iters=1000, lr=1e-6, weight_decay=1e-7):
+        optimizer = torch.optim.Adam(self.terrain_encoder.parameters(), lr=lr, weight_decay=weight_decay)
+
+        for i in range(n_iters):
+            self.dphys.init_shoot_states()  # load initial states for the shooter
+
+            # predict heightmaps
+            torch_hms = self.terrain_encoder(*cam_data).squeeze(1)
+            # set new heightmaps
+            self.dphys.update_heightmaps(torch_hms)
+            # forward pass
+            body_q, loss = self.dphys.simulate_and_backward(use_graph=self.use_cuda_graph)
+            print('loss: ', loss.numpy())
+
+            optimizer.step()
+            # necessary, since tape.zero() does not reach the torch tensor for some reason
+            optimizer.zero_grad(set_to_none=False)
+
+            if self.use_renderer and i % 20 == 0:
+                self.dphys.save_shoot_init_vels()  # save states for shooter
+                self.dphys.simulate_single()  # simulate a single long trajectory for testing
+                self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
+                self.dphys.render_simulation(pause=False)
+
+    def run(self, cam_data, timesteps, poses, controls, flipper_angles, T_horizon, T_s):
+        assert len(cam_data) == 6, 'cam_data should contain 6 tensors'
+        assert len(cam_data[0]) == self.num_robots, 'cam_data should have the same number of robots as the batch size'
+        assert len(timesteps) == self.num_robots, 'timesteps should have the same number of robots as the batch size'
+        assert len(poses) == self.num_robots, 'poses should have the same number of robots as the batch size'
+        assert poses[0].shape[1] == 7, 'poses should have shape (num_poses, 7)'
+        assert len(controls) == self.num_robots, 'controls should have the same number of robots as the batch size'
+        assert len(flipper_angles) == self.num_robots, 'flipper_angles should have the same number of robots as the batch size'
+
+        # set the simulated time horizon
+        self.dphys.set_T(T_horizon, T_s)
+        # print('setting ground truth trajectories')
+        self.dphys.set_target_poses(timesteps, poses)
+        # print('setting controls')
+        self.dphys.set_control(controls, flipper_angles)
+
+        if self.use_renderer:
+            self.dphys.render_heightmaps()
+            self.dphys.render_traj(poses[:, :3])
+
+        self.optimization(cam_data, n_iters=2000, lr=1e-6, weight_decay=1e-7)
+
+def main():
+    device = "cuda"
+
+    # get camera data
+    terrain_encoder_cfg = read_yaml('config/lss_cfg_tradr.yaml')
+    img_paths = sorted([os.path.join('data_sample/tradr/images/', f) for f in os.listdir('data_sample/tradr/images/')
+                        if f.endswith('.png')])
+    cameras = sorted(['camera_front', 'camera_left', 'camera_right', 'camera_rear_left', 'camera_rear_right'])
+    calib_path = 'data_sample/tradr/calibration/'
+    cam_data = get_cam_data(img_paths, cameras, calib_path, terrain_encoder_cfg, device=device)
+    num_robots = len(cam_data[0])  # equals to the batch size
+
+    # get ground truth trajectory
+    T_horizon = 5000
+    T_s = 300
+    timesteps, poses = get_gt_trajectory(num_robots, T_horizon)
+
+    # get control inputs
+    controls, flipper_angles = get_control_inputs(num_robots, T_horizon)
+
+    learner = Learner(num_robots=num_robots, terrain_encoder_cfg=terrain_encoder_cfg, device=device, use_renderer=False)
+    learner.run(cam_data, timesteps, poses, controls, flipper_angles, T_horizon, T_s)
+
+
+if __name__ == '__main__':
+    main()
