@@ -6,6 +6,7 @@ import numpy as np
 import os
 from PIL import Image
 import yaml
+from scipy.spatial.transform import Rotation
 from src.utils import sample_augmentation, img_transform, normalize_img, load_calib
 from src.models.DiffSim import DiffSim
 from src.models.TerrainEncoder import compile_model
@@ -20,14 +21,13 @@ def read_yaml(path):
     return data
 
 
-def get_cam_data(img_paths, cameras, calib_path, terrain_encoder_cfg, device='cuda'):
+def get_cam_data(img_paths, cameras, calib, terrain_encoder_cfg, device='cuda'):
     imgs = []
     rots = []
     trans = []
     post_rots = []
     post_trans = []
     intrins = []
-    calib = load_calib(calib_path)
     for cam, img_path in zip(cameras, img_paths):
         img = Image.open(img_path)
         K = calib[cam]['camera_matrix']['data']
@@ -68,18 +68,63 @@ def get_cam_data(img_paths, cameras, calib_path, terrain_encoder_cfg, device='cu
     return cam_data
 
 
-def get_gt_trajectory(num_robots, T_horizon):
+def get_gt_trajectories(poses_path, ids, calib, n_frames=10):
+    def pose2mat(pose):
+        T = np.eye(4)
+        T[:3, :4] = pose.reshape((3, 4))
+        return T
+
+    def id2stamp(id):
+        sec, nsec = id.split('_')
+        assert len(sec) == 10, 'seconds should have 10 digits'
+        assert len(nsec) == 9, 'nanoseconds should have 9 digits'
+        sec = float(sec)
+        nsec = float(nsec)
+        return sec + nsec * 1e-9
+
     # define target poses with timestamps for each robot
     num_poses = 30
+    num_robots = len(ids)
+    T_horizon = 5000
     poses0 = np.zeros((num_poses, 7))
     poses0[:, 6] = 1  # quaternion w
     poses0[:, 0] = np.arange(num_poses) / num_poses * 1  # x coordinate
     poses0[:, 2] = 1.0
     timesteps0 = (T_horizon * np.arange(num_poses) / num_poses).astype(int)
-    poses = [poses0[:] for _ in range(num_robots)]
-    timesteps = [timesteps0[:] for _ in range(num_robots)]
+    poses_list = [poses0[:] for _ in range(num_robots)]
+    timestamps_list = [timesteps0[:] for _ in range(num_robots)]
 
-    return timesteps, poses
+    # data = np.loadtxt(poses_path, delimiter=',', skiprows=1)
+    # all_timestamps, Ts = data[:, 0], data[:, 1:13]
+    # lidar_poses = np.asarray([pose2mat(pose) for pose in Ts], dtype=np.float32)
+    # # poses of the robot in the map frame
+    # Tr_robot_lidar = calib['transformations']['T_base_link__os_sensor']['data']
+    # Tr_robot_lidar = np.asarray(Tr_robot_lidar, dtype=np.float32).reshape((4, 4))
+    # Tr_lidar_robot = np.linalg.inv(Tr_robot_lidar)
+    # all_poses = lidar_poses @ Tr_lidar_robot
+    #
+    # poses_list = []
+    # timestamps_list = []
+    # for id in ids:
+    #     stamp = id2stamp(id)
+    #     il = np.argmin(np.abs(all_timestamps - stamp))
+    #     ir = np.clip(il + n_frames, 0, len(all_timestamps))
+    #     poses = all_poses[il:ir]
+    #     timestamps = np.asarray(all_timestamps[il:ir])
+    #     assert len(poses) > 0, f'No poses found for trajectory {id}'
+    #     poses = np.linalg.inv(poses[0]) @ poses
+    #     timestamps -= timestamps[0]
+    #
+    #     # turn poses into quaternions
+    #     xyz = poses[:, :3, 3]
+    #     quats = np.asarray([Rotation.from_matrix(pose[:3, :3]).as_quat() for pose in poses], dtype=np.float32)
+    #     poses = np.concatenate([xyz, quats], axis=1)
+    #     timestamps_ms = timestamps * 1e3
+    #
+    #     poses_list.append(poses)
+    #     timestamps_list.append(timestamps_ms.astype(int))
+
+    return timestamps_list, poses_list
 
 def get_control_inputs(num_robots, T_horizon):
     # define control input for each robot
@@ -92,20 +137,23 @@ def get_control_inputs(num_robots, T_horizon):
 
 
 class Learner:
-    def __init__(self, num_robots, terrain_encoder_cfg, device='cuda', use_renderer=False):
+    def __init__(self, num_robots, terrain_encoder_cfg, terrain_encoder_weights=None, device='cuda', use_renderer=False):
         self.device = device
         self.use_cuda_graph = True if device == 'cuda' else False
         self.use_renderer = use_renderer
         self.num_robots = num_robots
 
         self.terrain_encoder_cfg = terrain_encoder_cfg
-        self.terrain_encoder = self.init_terrain_enccoder(terrain_encoder_cfg)
+        self.terrain_encoder = self.init_terrain_encoder(terrain_encoder_cfg, weights=terrain_encoder_weights)
 
         self.torch_hms, self.res = self.get_initial_heightmaps(num_robots=num_robots)
         self.dphys = self.init_diff_physics(self.torch_hms, self.res)
 
-    def init_terrain_enccoder(self, terrain_encoder_cfg):
+    def init_terrain_encoder(self, terrain_encoder_cfg, weights=None):
         terrain_encoder = compile_model(terrain_encoder_cfg['grid_conf'], terrain_encoder_cfg['data_aug_conf'])
+        if weights is not None:
+            assert os.path.exists(weights), f'weights file {weights} does not exist'
+            terrain_encoder.load_state_dict(torch.load(weights, map_location=self.device))
         terrain_encoder.to(self.device)
         terrain_encoder.train()
         return terrain_encoder
@@ -149,10 +197,10 @@ class Learner:
                 self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
                 self.dphys.render_simulation(pause=False)
 
-    def learn(self, cam_data, timesteps, poses, controls, flipper_angles, T_horizon, T_s):
+    def learn(self, cam_data, timestamps, poses, controls, flipper_angles, T_horizon, T_s):
         assert len(cam_data) == 6, 'cam_data should contain 6 tensors'
         assert len(cam_data[0]) == self.num_robots, 'cam_data should have the same number of robots as the batch size'
-        assert len(timesteps) == self.num_robots, 'timesteps should have the same number of robots as the batch size'
+        assert len(timestamps) == self.num_robots, 'timestamps should have the same number of robots as the batch size'
         assert len(poses) == self.num_robots, 'poses should have the same number of robots as the batch size'
         assert poses[0].shape[1] == 7, 'poses should have shape (num_poses, 7)'
         assert len(controls) == self.num_robots, 'controls should have the same number of robots as the batch size'
@@ -161,7 +209,7 @@ class Learner:
         # set the simulated time horizon
         self.dphys.set_T(T_horizon, T_s)
         # print('setting ground truth trajectories')
-        self.dphys.set_target_poses(timesteps, poses)
+        self.dphys.set_target_poses(timestamps, poses)
         # print('setting controls')
         self.dphys.set_control(controls, flipper_angles)
 
@@ -169,7 +217,7 @@ class Learner:
             self.dphys.render_heightmaps()
             self.dphys.render_traj(poses[0][:, :3])
 
-        self.optimization(cam_data, n_iters=2000, lr=1e-6, weight_decay=1e-7)
+        self.optimization(cam_data, n_iters=2000, lr=1e-3, weight_decay=1e-7)
 
 
 def main():
@@ -178,24 +226,32 @@ def main():
 
     # get camera data
     terrain_encoder_cfg = read_yaml('config/lss_cfg_tradr.yaml')
+    terrain_encoder_weights = 'config/weights/lss_robingas_tradr.pt'
     img_paths = sorted([os.path.join('data_sample/tradr/images/', f) for f in os.listdir('data_sample/tradr/images/')
                         if f.endswith('.png')])
     cameras = sorted(['camera_front', 'camera_left', 'camera_right', 'camera_rear_left', 'camera_rear_right'])
     calib_path = 'data_sample/tradr/calibration/'
-    cam_data = get_cam_data(img_paths, cameras, calib_path, terrain_encoder_cfg, device=device)
+    poses_path = 'data_sample/tradr/poses/lidar_poses.csv'
+    clouds_path = 'data_sample/tradr/clouds/'
+
+    calib = load_calib(calib_path)
+    cam_data = get_cam_data(img_paths, cameras, calib, terrain_encoder_cfg, device=device)
     num_robots = len(cam_data[0])  # equals to the batch size
 
     # get ground truth trajectory
-    T_horizon = 5000
-    T_s = 300
-    timesteps, poses = get_gt_trajectory(num_robots, T_horizon)
+    ids = [f.split('.')[0] for f in os.listdir(clouds_path)]
+    timestamps_ms, poses = get_gt_trajectories(poses_path, ids, calib)
+    T_horizon_ms = int(timestamps_ms[0][-1])
+    T_segment_ms = 300
+    print('T_horizon_ms: ', T_horizon_ms)
 
     # get control inputs
-    controls, flipper_angles = get_control_inputs(num_robots, T_horizon)
+    controls, flipper_angles = get_control_inputs(num_robots, T_horizon_ms)
 
-    learner = Learner(num_robots=num_robots, terrain_encoder_cfg=terrain_encoder_cfg,
+    learner = Learner(num_robots=num_robots,
+                      terrain_encoder_cfg=terrain_encoder_cfg, terrain_encoder_weights=terrain_encoder_weights,
                       device=device, use_renderer=use_renderer)
-    learner.learn(cam_data, timesteps, poses, controls, flipper_angles, T_horizon, T_s)
+    learner.learn(cam_data, timestamps_ms, poses, controls, flipper_angles, T_horizon_ms, T_segment_ms)
 
 
 if __name__ == '__main__':
