@@ -412,10 +412,10 @@ class DiffSim:
             tape.reset()  # reset tape
         return self.body_q, self.loss
 
-    def simulate_and_backward_torch_tensor(self, torch_hms):
+    def simulate_and_backward_torch_tensor(self, torch_hms, use_graph=False):
         torch_hms_warped = wp.from_torch(torch_hms)  # zero copy to warp
         wp.launch(torch_hms_to_warp, dim=torch_hms.size(), inputs=[torch_hms_warped, self.heightmap_array], device=self.device)
-        self.simulate_and_backward()  # run simulation, loss and backward pass to heightmaps
+        self.simulate_and_backward(use_graph)  # run simulation, loss and backward pass to heightmaps
         for robot_idx in range(self.sim_robots):  # needs to be done in python loop... WTF
             curr_grad = self.heightmap_list[robot_idx].heights.grad
             # and copy the gradients back to the torch tensor

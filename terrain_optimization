@@ -181,10 +181,10 @@ class Learner:
             # predict heightmaps
             torch_hms = self.terrain_encoder(*cam_data).squeeze(1)
             # set new heightmaps
-            self.dphys.update_heightmaps(torch_hms)
+            # self.dphys.update_heightmaps(torch_hms)  # not needed anymore!
             # forward pass
-            body_q, loss = self.dphys.simulate_and_backward(use_graph=self.use_cuda_graph)
-            torch_hms.sum().backward()
+            body_q, loss = self.dphys.simulate_and_backward_torch_tensor(torch_hms, use_graph=self.use_cuda_graph)
+            torch_hms.backward(torch_hms.grad)
             print('loss: ', loss.numpy())
 
             optimizer.step()
