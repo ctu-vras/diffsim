@@ -32,6 +32,19 @@ def lossL2(gt_body_q: wp.array(dtype=wp.transformf), sim_body_q: wp.array2d(dtyp
     att_err = wp.length_sq(target_att - sim_att)
     wp.atomic_add(loss, 0, dist + att_err)
 
+
+@wp.kernel
+def torch_hms_to_warp(torch_hms: wp.array3d(dtype=wp.float32), warp_hms: wp.array(dtype=Heightmap)):
+    robot_idx, i, j = wp.tid()
+    warp_hms[robot_idx].heights[i, j] = torch_hms[robot_idx, i, j]
+
+
+@wp.kernel
+def warp_hm_to_torch(heights: wp.array2d(dtype=wp.float32), torch_hms: wp.array3d(dtype=wp.float32), robot_idx: int):
+    i, j = wp.tid()
+    torch_hms[robot_idx, i, j] = heights[i, j]
+
+
 @wp.kernel
 def copy_state(body_q: wp.array2d(dtype=wp.transformf), state_body_q: wp.array(dtype=wp.transformf), sim_idx: int):
     """copy the simulation state body_q into rendering state state_body_q at index sim_idx"""
@@ -397,6 +410,16 @@ class DiffSim:
             tape.backward(loss=self.loss)  # propagate gradients into heightmaps
             tape.zero()  # zero out all variable gradients (except for the heightmaps for some reason...)
             tape.reset()  # reset tape
+        return self.body_q, self.loss
+
+    def simulate_and_backward_torch_tensor(self, torch_hms):
+        torch_hms_warped = wp.from_torch(torch_hms)  # zero copy to warp
+        wp.launch(torch_hms_to_warp, dim=torch_hms.size(), inputs=[torch_hms_warped, self.heightmap_array], device=self.device)
+        self.simulate_and_backward()  # run simulation, loss and backward pass to heightmaps
+        for robot_idx in range(self.sim_robots):  # needs to be done in python loop... WTF
+            curr_grad = self.heightmap_list[robot_idx].heights.grad
+            # and copy the gradients back to the torch tensor
+            wp.launch(warp_hm_to_torch, dim=torch_hms_warped.shape[1:], inputs=[curr_grad, torch_hms_warped.grad, robot_idx], device=self.device)
         return self.body_q, self.loss
 
     def simulate_flippers_heightmap(self, sim_idx, num_shoots=None):
