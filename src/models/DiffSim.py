@@ -420,6 +420,7 @@ class DiffSim:
             curr_grad = self.heightmap_list[robot_idx].heights.grad
             # and copy the gradients back to the torch tensor
             wp.launch(warp_hm_to_torch, dim=torch_hms_warped.shape[1:], inputs=[curr_grad, torch_hms_warped.grad, robot_idx], device=self.device)
+            curr_grad.zero_()  # zero out the gradients after copying
         return self.body_q, self.loss
 
     def simulate_flippers_heightmap(self, sim_idx, num_shoots=None):
