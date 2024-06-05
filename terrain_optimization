@@ -151,8 +151,8 @@ class Learner:
 
     def init_terrain_encoder(self, terrain_encoder_cfg, weights=None):
         terrain_encoder = compile_model(terrain_encoder_cfg['grid_conf'], terrain_encoder_cfg['data_aug_conf'])
-        if weights is not None:
-            assert os.path.exists(weights), f'weights file {weights} does not exist'
+        if weights is not None and os.path.exists(weights):
+            print(f'Loading pretrained LSS weights from {weights}')
             terrain_encoder.load_state_dict(torch.load(weights, map_location=self.device))
         terrain_encoder.to(self.device)
         terrain_encoder.train()
@@ -180,8 +180,6 @@ class Learner:
 
             # predict heightmaps
             torch_hms = self.terrain_encoder(*cam_data).squeeze(1)
-            # set new heightmaps
-            # self.dphys.update_heightmaps(torch_hms)  # not needed anymore!
             # forward pass
             body_q, loss = self.dphys.simulate_and_backward_torch_tensor(torch_hms, use_graph=self.use_cuda_graph)
             torch_hms.backward(torch_hms.grad)
