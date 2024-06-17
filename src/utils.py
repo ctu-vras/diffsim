@@ -5,6 +5,7 @@ import torch
 import torchvision
 from PIL import Image
 import yaml
+from numpy.lib.recfunctions import structured_to_unstructured
 
 
 def load_config(fname):
@@ -206,3 +207,34 @@ def load_calib(calib_path):
     calib['clearance'] = np.abs(T[2, 3])
 
     return calib
+
+def normalize(x, qlow=0., qhigh=1., eps=1e-6, ):
+    assert qlow < qhigh
+    assert qlow >= 0 and qhigh <= 1
+    assert eps > 0
+    """Scale to range 0..1"""
+    if isinstance(x, torch.Tensor):
+        x_max = torch.quantile(x, qhigh).item()
+        x_min = torch.quantile(x, qlow).item()
+        x = (x - x_min) / np.max([(x_max - x_min), eps])
+        x = x.clamp(0, 1)
+    else:
+        x_max = np.percentile(x, 100 * qhigh)
+        x_min = np.percentile(x, 100 * qlow)
+        x = (x - x_min) / np.max([(x_max - x_min), eps])
+        x = x.clip(0, 1)
+    return x
+
+def position(cloud):
+    """Cloud to point positions (xyz)."""
+    if cloud.dtype.names:
+        x = structured_to_unstructured(cloud[['x', 'y', 'z']])
+    else:
+        x = cloud
+    return x
+
+
+def read_yaml(path):
+    with open(path, 'r') as f:
+        data = yaml.load(f, Loader=yaml.Loader)
+    return data

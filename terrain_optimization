@@ -5,71 +5,20 @@ import warp as wp
 import numpy as np
 import os
 from PIL import Image
-import yaml
+from diffsim.src.utils import read_yaml
+from src.data.robingas import compile_data
 from src.utils import sample_augmentation, img_transform, normalize_img, load_calib
 from src.models.DiffSim import DiffSim
 from src.models.TerrainEncoder import compile_model
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader
 from datetime import datetime
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 wp.init()  # init warp!
 
 
-def read_yaml(path):
-    with open(path, 'r') as f:
-        data = yaml.load(f, Loader=yaml.Loader)
-    return data
-
-
-def get_cam_data(img_paths, cameras, calib, terrain_encoder_cfg, device='cpu'):
-    imgs = []
-    rots = []
-    trans = []
-    post_rots = []
-    post_trans = []
-    intrins = []
-    for cam, img_path in zip(cameras, img_paths):
-        img = Image.open(img_path)
-        K = calib[cam]['camera_matrix']['data']
-        K = np.asarray(K, dtype=np.float32).reshape((3, 3))
-        post_rot = torch.eye(2)
-        post_tran = torch.zeros(2)
-        # augmentation (resize, crop, horizontal flip, rotate)
-        resize, resize_dims, crop, flip, rotate = sample_augmentation(terrain_encoder_cfg)
-        img, post_rot2, post_tran2 = img_transform(img, post_rot, post_tran,
-                                                   resize=resize,
-                                                   resize_dims=resize_dims,
-                                                   crop=crop,
-                                                   flip=flip,
-                                                   rotate=rotate)
-        # for convenience, make augmentation matrices 3x3
-        post_tran = torch.zeros(3)
-        post_rot = torch.eye(3)
-        post_tran[:2] = post_tran2
-        post_rot[:2, :2] = post_rot2
-        # rgb and intrinsics
-        img = normalize_img(img)
-        K = torch.as_tensor(K)
-        # extrinsics
-        T_robot_cam = calib['transformations'][f'T_base_link__{cam}']['data']
-        T_robot_cam = np.asarray(T_robot_cam, dtype=np.float32).reshape((4, 4))
-        rot = torch.as_tensor(T_robot_cam[:3, :3])
-        tran = torch.as_tensor(T_robot_cam[:3, 3])
-        imgs.append(img)
-        rots.append(rot)
-        trans.append(tran)
-        intrins.append(K)
-        post_rots.append(post_rot)
-        post_trans.append(post_tran)
-    cam_data = [torch.stack(imgs), torch.stack(rots), torch.stack(trans),
-                torch.stack(intrins), torch.stack(post_rots), torch.stack(post_trans)]
-    cam_data = [torch.as_tensor(i[None], dtype=torch.float32, device=device) for i in cam_data]
-
-    return cam_data
-
-
-def get_gt_trajectories(poses_path, ids, calib, n_frames=10):
+def get_gt_trajectories(batch_size):
     def pose2mat(pose):
         T = np.eye(4)
         T[:3, :4] = pose.reshape((3, 4))
@@ -85,15 +34,14 @@ def get_gt_trajectories(poses_path, ids, calib, n_frames=10):
 
     # define target poses with timestamps for each robot
     num_poses = 30
-    num_robots = len(ids)
     T_horizon = 5000
     poses0 = np.zeros((num_poses, 7))
     poses0[:, 6] = 1  # quaternion w
     poses0[:, 0] = np.arange(num_poses) / num_poses * 1  # x coordinate
     poses0[:, 2] = 1.0
     timesteps0 = (T_horizon * np.arange(num_poses) / num_poses).astype(int)
-    poses_list = [poses0[:] for _ in range(num_robots)]
-    timestamps_list = [timesteps0[:] for _ in range(num_robots)]
+    poses_list = [poses0[:] for _ in range(batch_size)]
+    timestamps_list = [timesteps0[:] for _ in range(batch_size)]
 
     # data = np.loadtxt(poses_path, delimiter=',', skiprows=1)
     # all_timestamps, Ts = data[:, 0], data[:, 1:13]
@@ -127,40 +75,43 @@ def get_gt_trajectories(poses_path, ids, calib, n_frames=10):
 
     return timestamps_list, poses_list
 
-def get_control_inputs(num_robots, T_horizon):
+def get_control_inputs(batch_size, T_horizon):
     # define control input for each robot
-    controls0 = 0.2 * np.ones((T_horizon, num_robots, 2))
-    flipper_angles0 = np.zeros((T_horizon, num_robots, 4))
-    controls = [controls0[:] for _ in range(num_robots)]
-    flipper_angles = [flipper_angles0[:] for _ in range(num_robots)]
+    controls0 = 0.2 * np.ones((T_horizon, batch_size, 2))
+    flipper_angles0 = np.zeros((T_horizon, batch_size, 4))
+    controls = [controls0[:] for _ in range(batch_size)]
+    flipper_angles = [flipper_angles0[:] for _ in range(batch_size)]
 
     return controls, flipper_angles
 
 
-def get_geom_heightmaps(ids, device='cpu'):
-    height = np.zeros((128, 128))
-    mask = np.ones((128, 128))
-    hm = np.stack([height, mask], axis=0)
-    hm = torch.as_tensor(hm, dtype=torch.float32, device=device)
-    return hm
-
-
 class Learner:
-    def __init__(self, num_robots, terrain_encoder_cfg, terrain_encoder_weights=None, device='cpu', use_renderer=False):
+    def __init__(self, batch_size, lr=1e-3, weight_decay=1e-7,
+                 robot='tradr', device='cpu', use_renderer=False):
         self.device = device
         self.use_cuda_graph = True if device == 'cuda' else False
         self.use_renderer = use_renderer
-        self.num_robots = num_robots
+        self.batch_size = batch_size
 
-        self.terrain_encoder_cfg = terrain_encoder_cfg
-        self.terrain_encoder = self.init_terrain_encoder(terrain_encoder_cfg, weights=terrain_encoder_weights)
+        self.terrain_encoder_cfg = read_yaml(f'config/lss_cfg_{robot}.yaml')
+        self.terrain_encoder_weights = f'config/weights/lss_robingas_{robot}.pt'
+        self.terrain_encoder = self.init_terrain_encoder(self.terrain_encoder_cfg, weights=self.terrain_encoder_weights)
 
         self.dphys = self.init_diff_physics()
 
         self.geom_hm_loss_fn = torch.nn.MSELoss(reduction='none')
+        self.optimizer = torch.optim.Adam(self.terrain_encoder.parameters(), lr=lr, weight_decay=weight_decay)
+
+        self.data_loader = self.init_dataloader(batch_size=batch_size)
 
         log_dir = f'config/tb_runs/{datetime.now().strftime("%Y_%m_%d_%H_%M_%S")}'
         self.tb_writer = SummaryWriter(log_dir=log_dir)
+
+    def init_dataloader(self, batch_size=1):
+        ds = compile_data(seq_i=1, robot='tradr', small=True)
+        print('Dataset size:', len(ds))
+        data_loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+        return data_loader
 
     def init_terrain_encoder(self, terrain_encoder_cfg, weights=None):
         terrain_encoder = compile_model(terrain_encoder_cfg['grid_conf'], terrain_encoder_cfg['data_aug_conf'])
@@ -172,18 +123,18 @@ class Learner:
         return terrain_encoder
 
     def init_diff_physics(self):
-        torch_hms, res = self.get_initial_heightmaps(self.num_robots)
+        torch_hms, res = self.get_initial_heightmaps(self.batch_size)
         dphys = DiffSim(torch_hms, res, use_renderer=self.use_renderer, device=self.device)
         return dphys
 
-    def get_initial_heightmaps(self, num_robots):
+    def get_initial_heightmaps(self, batch_size):
         xbound = self.terrain_encoder_cfg['grid_conf']['xbound']
         ybound = self.terrain_encoder_cfg['grid_conf']['ybound']
         grid_res = xbound[2]
         shp = (int((xbound[1] - xbound[0]) / grid_res), int((ybound[1] - ybound[0]) / grid_res))
         torch_hms = [torch.zeros(shp, dtype=torch.float32, device=self.device, requires_grad=True)
-                     for _ in range(num_robots)]
-        res = [grid_res for _ in range(num_robots)]  # heightmap resolutions
+                     for _ in range(batch_size)]
+        res = [grid_res for _ in range(batch_size)]  # heightmap resolutions
         return torch_hms, res
 
     def geom_hm_loss(self, height_pred, height_gt, weights=None):
@@ -203,55 +154,58 @@ class Learner:
         loss = (self.geom_hm_loss_fn(height_pred * weights, height_gt * weights)).mean()
         return loss
 
-    def optimization(self, cam_data, geom_hms, n_iters=1000, lr=1e-6, weight_decay=1e-7):
-        optimizer = torch.optim.Adam(self.terrain_encoder.parameters(), lr=lr, weight_decay=weight_decay)
+    def step(self, imgs_data, hm_geom, i):
+        self.dphys.init_shoot_states()  # load initial states for the shooter
 
-        for i in range(n_iters):
-            self.dphys.init_shoot_states()  # load initial states for the shooter
+        # predict heightmaps
+        height_pred = self.terrain_encoder(*imgs_data).squeeze(1)
+        # dphysics trajectory loss
+        _, loss_traj = self.dphys.simulate_and_backward_torch_tensor(height_pred, use_graph=self.use_cuda_graph)
+        loss_traj = wp.to_torch(loss_traj)
+        print('loss_traj: ', loss_traj)
+        self.tb_writer.add_scalar('loss_traj', loss_traj, i)
 
-            # predict heightmaps
-            height_pred = self.terrain_encoder(*[c.clone() for c in cam_data]).squeeze(1)
-            # dphysics trajectory loss
-            _, loss_traj = self.dphys.simulate_and_backward_torch_tensor(height_pred, use_graph=self.use_cuda_graph)
-            loss_traj = wp.to_torch(loss_traj)
-            print('loss_traj: ', loss_traj)
-            self.tb_writer.add_scalar('loss_traj', loss_traj, i)
+        # geometry heightmap loss
+        loss_geom = self.geom_hm_loss(height_gt=hm_geom[:, 0], height_pred=height_pred, weights=hm_geom[:, 1])
+        print('loss_geom: ', loss_geom)
+        self.tb_writer.add_scalar('loss_geom', loss_geom, i)
 
-            # geometry heightmap loss
-            loss_geom = self.geom_hm_loss(height_gt=geom_hms[0:1], height_pred=height_pred, weights=geom_hms[1:2])
-            print('loss_geom: ', loss_geom)
-            self.tb_writer.add_scalar('loss_geom', loss_geom, i)
+        loss = loss_geom + loss_traj
+        print('loss: ', loss.item())
+        self.tb_writer.add_scalar('loss', loss, i)
 
-            loss = loss_geom + loss_traj
-            print('loss: ', loss.item())
-            self.tb_writer.add_scalar('loss', loss, i)
+        height_pred.backward(height_pred.grad, retain_graph=True)
+        loss_geom.backward(retain_graph=True)
 
-            height_pred.backward(height_pred.grad, retain_graph=True)
-            loss_geom.backward(retain_graph=True)
+        self.optimizer.step()
+        # necessary, since tape.zero() does not reach the torch tensor for some reason
+        self.optimizer.zero_grad(set_to_none=False)
 
-            optimizer.step()
-            # necessary, since tape.zero() does not reach the torch tensor for some reason
-            optimizer.zero_grad(set_to_none=False)
+        if self.use_renderer and i % 20 == 0:
+            self.dphys.save_shoot_init_vels()  # save states for shooter
+            self.dphys.simulate_single()  # simulate a single long trajectory for testing
+            self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
+            self.dphys.render_simulation(pause=False)
 
-            if self.use_renderer and i % 20 == 0:
-                self.dphys.save_shoot_init_vels()  # save states for shooter
-                self.dphys.simulate_single()  # simulate a single long trajectory for testing
-                self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
-                self.dphys.render_simulation(pause=False)
+    def learn(self):
+        batch = next(iter(self.data_loader))
+        batch = [torch.as_tensor(b, dtype=torch.float32, device=self.device) for b in batch]
+        img, rot, tran, intrins, post_rots, post_trans, hm_geom, hm_terrain = batch
+        imgs_data = [img, rot, tran, intrins, post_rots, post_trans]
 
-    def learn(self, cam_data, geom_hms, timestamps, poses, controls, flipper_angles, T_horizon, T_s):
-        assert len(cam_data) == 6, 'cam_data should contain 6 tensors'
-        assert len(cam_data[0]) == self.num_robots, 'cam_data should have the same number of robots as the batch size'
-        assert len(timestamps) == self.num_robots, 'timestamps should have the same number of robots as the batch size'
-        assert len(poses) == self.num_robots, 'poses should have the same number of robots as the batch size'
-        assert poses[0].shape[1] == 7, 'poses should have shape (num_poses, 7)'
-        assert len(controls) == self.num_robots, 'controls should have the same number of robots as the batch size'
-        assert len(flipper_angles) == self.num_robots, 'flipper_angles should have the same number of robots as the batch size'
+        # get ground-truth trajectory
+        timestamps_ms, poses = get_gt_trajectories(self.batch_size)
+        T_horizon_ms = int(timestamps_ms[0][-1])
+        T_segment_ms = 300
+        print('T_horizon_ms: ', T_horizon_ms)
+
+        # get control inputs
+        controls, flipper_angles = get_control_inputs(self.batch_size, T_horizon_ms)
 
         # set the simulated time horizon
-        self.dphys.set_T(T_horizon, T_s)
+        self.dphys.set_T(T_horizon_ms, T_segment_ms)
         # print('setting ground truth trajectories')
-        self.dphys.set_target_poses(timestamps, poses)
+        self.dphys.set_target_poses(timestamps_ms, poses)
         # print('setting controls')
         self.dphys.set_control(controls, flipper_angles)
 
@@ -259,44 +213,21 @@ class Learner:
             self.dphys.render_heightmaps()
             self.dphys.render_traj(poses[0][:, :3])
 
-        self.optimization(cam_data, geom_hms, n_iters=2000, lr=1e-3, weight_decay=1e-7)
+        n_iters = 100
+        for i in range(n_iters):
+            self.step(imgs_data, hm_geom, i)
 
 
 def main():
     device = "cuda"
-    use_renderer = False
+    use_renderer = True
+    batch_size = 1
+    robot = 'tradr'
 
-    # get camera data
-    terrain_encoder_cfg = read_yaml('config/lss_cfg_tradr.yaml')
-    terrain_encoder_weights = 'config/weights/lss_robingas_tradr.pt'
-    img_paths = sorted([os.path.join('data_sample/tradr/images/', f) for f in os.listdir('data_sample/tradr/images/')
-                        if f.endswith('.png')])
-    cameras = sorted(['camera_front', 'camera_left', 'camera_right', 'camera_rear_left', 'camera_rear_right'])
-    calib_path = 'data_sample/tradr/calibration/'
-    poses_path = 'data_sample/tradr/poses/lidar_poses.csv'
-    clouds_path = 'data_sample/tradr/clouds/'
-
-    calib = load_calib(calib_path)
-    cam_data = get_cam_data(img_paths, cameras, calib, terrain_encoder_cfg, device=device)
-    num_robots = len(cam_data[0])  # equals to the batch size
-
-    # get ground-truth trajectory
-    ids = [f.split('.')[0] for f in os.listdir(clouds_path)]
-    timestamps_ms, poses = get_gt_trajectories(poses_path, ids, calib)
-    T_horizon_ms = int(timestamps_ms[0][-1])
-    T_segment_ms = 300
-    print('T_horizon_ms: ', T_horizon_ms)
-
-    # get control inputs
-    controls, flipper_angles = get_control_inputs(num_robots, T_horizon_ms)
-
-    # get geometry heightmaps
-    geom_hms = get_geom_heightmaps(ids, device=device)
-
-    learner = Learner(num_robots=num_robots,
-                      terrain_encoder_cfg=terrain_encoder_cfg, terrain_encoder_weights=terrain_encoder_weights,
+    learner = Learner(batch_size=batch_size,
+                      robot=robot,
                       device=device, use_renderer=use_renderer)
-    learner.learn(cam_data, geom_hms, timestamps_ms, poses, controls, flipper_angles, T_horizon_ms, T_segment_ms)
+    learner.learn()
 
 
 if __name__ == '__main__':

@@ -3,13 +3,19 @@ from ..data.heightmap import Heightmap, eval_heightmap_collisions_shoot
 import warp as wp
 import warp.sim.render
 from ..vis import get_heightmap_vis_ids, generate_force_vis
-from ..data.data_transforms import combine_transforms
 from scipy.spatial.transform import Rotation as R
 
 
 import sys
 np.set_printoptions(threshold=sys.maxsize)
 
+
+def combine_transforms(t1, t2):
+    pos1, quat1 = t1[:3], t1[3:]
+    pos2, quat2 = t2[:3], t2[3:]
+    pos = pos1 + R.from_quat(quat1).apply(pos2)
+    quat = (R.from_quat(quat1) * R.from_quat(quat2)).as_quat()
+    return np.concatenate([pos, quat])
 
 @wp.kernel
 def lossL2(gt_body_q: wp.array(dtype=wp.transformf), sim_body_q: wp.array2d(dtype=wp.transformf),

@@ -162,6 +162,7 @@ cython_debug/
 *.pth
 *.pt
 *.bak
+data/
 
 # Logs written by TensorBoard
 events.out.tfevents*
