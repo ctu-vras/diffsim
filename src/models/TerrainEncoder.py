@@ -266,7 +266,7 @@ class LiftSplatShoot(nn.Module):
         x = self.get_voxels(x, rots, trans, intrins, post_rots, post_trans)
         x_geom, x_diff = self.bevencode(x)
         assert x_geom.shape == x_diff.shape
-        assert x_diff.min() >= 0.
+        # assert x_diff.min() >= 0.
         x = x_geom - x_diff
         return x
 

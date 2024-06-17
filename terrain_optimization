@@ -6,7 +6,6 @@ import numpy as np
 import os
 from PIL import Image
 import yaml
-from scipy.spatial.transform import Rotation
 from src.utils import sample_augmentation, img_transform, normalize_img, load_calib
 from src.models.DiffSim import DiffSim
 from src.models.TerrainEncoder import compile_model
@@ -136,6 +135,14 @@ def get_control_inputs(num_robots, T_horizon):
     return controls, flipper_angles
 
 
+def get_geom_heightmaps(id, device='cuda'):
+    height = np.zeros((128, 128))
+    mask = np.ones((128, 128))
+    hm = np.stack([height, mask], axis=0)
+    hm = torch.as_tensor(hm, dtype=torch.float32, device=device)
+    return hm
+
+
 class Learner:
     def __init__(self, num_robots, terrain_encoder_cfg, terrain_encoder_weights=None, device='cuda', use_renderer=False):
         self.device = device
@@ -146,8 +153,9 @@ class Learner:
         self.terrain_encoder_cfg = terrain_encoder_cfg
         self.terrain_encoder = self.init_terrain_encoder(terrain_encoder_cfg, weights=terrain_encoder_weights)
 
-        self.torch_hms, self.res = self.get_initial_heightmaps(num_robots=num_robots)
-        self.dphys = self.init_diff_physics(self.torch_hms, self.res)
+        self.dphys = self.init_diff_physics()
+
+        self.geom_hm_loss_fn = torch.nn.MSELoss(reduction='none')
 
     def init_terrain_encoder(self, terrain_encoder_cfg, weights=None):
         terrain_encoder = compile_model(terrain_encoder_cfg['grid_conf'], terrain_encoder_cfg['data_aug_conf'])
@@ -158,7 +166,8 @@ class Learner:
         terrain_encoder.train()
         return terrain_encoder
 
-    def init_diff_physics(self, torch_hms, res):
+    def init_diff_physics(self):
+        torch_hms, res = self.get_initial_heightmaps(self.num_robots)
         dphys = DiffSim(torch_hms, res, use_renderer=self.use_renderer, device=self.device)
         return dphys
 
@@ -172,18 +181,40 @@ class Learner:
         res = [grid_res for _ in range(num_robots)]  # heightmap resolutions
         return torch_hms, res
 
-    def optimization(self, cam_data, n_iters=1000, lr=1e-6, weight_decay=1e-7):
+    def geom_hm_loss(self, height_pred, height_gt, weights=None):
+        assert height_pred.shape == height_gt.shape, 'Height prediction and ground truth must have the same shape'
+        if weights is None:
+            weights = torch.ones_like(height_gt)
+        assert weights.shape == height_gt.shape, 'Weights and height ground truth must have the same shape'
+
+        # handle imbalanced height distribution (increase weights for higher heights / obstacles)
+        h_mean = height_gt[weights.bool()].mean()
+        # the higher the difference from mean the higher the weight
+        weights_h = 1.0 + torch.abs(height_gt - h_mean)
+        # apply height difference weights
+        weights = weights * weights_h
+
+        # compute weighted loss
+        loss = (self.geom_hm_loss_fn(height_pred * weights, height_gt * weights)).mean()
+        return loss
+
+    def optimization(self, cam_data, geom_hms, n_iters=1000, lr=1e-6, weight_decay=1e-7):
         optimizer = torch.optim.Adam(self.terrain_encoder.parameters(), lr=lr, weight_decay=weight_decay)
 
         for i in range(n_iters):
             self.dphys.init_shoot_states()  # load initial states for the shooter
 
             # predict heightmaps
-            torch_hms = self.terrain_encoder(*cam_data).squeeze(1)
-            # forward pass
-            body_q, loss = self.dphys.simulate_and_backward_torch_tensor(torch_hms, use_graph=self.use_cuda_graph)
-            torch_hms.backward(torch_hms.grad)
-            print('loss: ', loss.numpy())
+            height_pred = self.terrain_encoder(*cam_data).squeeze(1)
+            # dphysics trajectory loss
+            _, loss_traj = self.dphys.simulate_and_backward_torch_tensor(height_pred, use_graph=self.use_cuda_graph)
+            height_pred.backward(height_pred.grad)
+            print('loss_traj: ', loss_traj.numpy())
+
+            # geometry heightmap loss
+            loss_geom = self.geom_hm_loss(height_gt=geom_hms[0:1], height_pred=height_pred, weights=geom_hms[1:2])
+            print('loss_geom: ', loss_geom.item())
+            # loss_geom.backward()
 
             optimizer.step()
             # necessary, since tape.zero() does not reach the torch tensor for some reason
@@ -195,7 +226,7 @@ class Learner:
                 self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
                 self.dphys.render_simulation(pause=False)
 
-    def learn(self, cam_data, timestamps, poses, controls, flipper_angles, T_horizon, T_s):
+    def learn(self, cam_data, geom_hms, timestamps, poses, controls, flipper_angles, T_horizon, T_s):
         assert len(cam_data) == 6, 'cam_data should contain 6 tensors'
         assert len(cam_data[0]) == self.num_robots, 'cam_data should have the same number of robots as the batch size'
         assert len(timestamps) == self.num_robots, 'timestamps should have the same number of robots as the batch size'
@@ -215,12 +246,12 @@ class Learner:
             self.dphys.render_heightmaps()
             self.dphys.render_traj(poses[0][:, :3])
 
-        self.optimization(cam_data, n_iters=2000, lr=1e-3, weight_decay=1e-7)
+        self.optimization(cam_data, geom_hms, n_iters=2000, lr=1e-3, weight_decay=1e-7)
 
 
 def main():
     device = "cuda"
-    use_renderer = True
+    use_renderer = False
 
     # get camera data
     terrain_encoder_cfg = read_yaml('config/lss_cfg_tradr.yaml')
@@ -236,7 +267,7 @@ def main():
     cam_data = get_cam_data(img_paths, cameras, calib, terrain_encoder_cfg, device=device)
     num_robots = len(cam_data[0])  # equals to the batch size
 
-    # get ground truth trajectory
+    # get ground-truth trajectory
     ids = [f.split('.')[0] for f in os.listdir(clouds_path)]
     timestamps_ms, poses = get_gt_trajectories(poses_path, ids, calib)
     T_horizon_ms = int(timestamps_ms[0][-1])
@@ -246,10 +277,13 @@ def main():
     # get control inputs
     controls, flipper_angles = get_control_inputs(num_robots, T_horizon_ms)
 
+    # get geometry heightmaps
+    geom_hms = get_geom_heightmaps(id, device=device)
+
     learner = Learner(num_robots=num_robots,
                       terrain_encoder_cfg=terrain_encoder_cfg, terrain_encoder_weights=terrain_encoder_weights,
                       device=device, use_renderer=use_renderer)
-    learner.learn(cam_data, timestamps_ms, poses, controls, flipper_angles, T_horizon_ms, T_segment_ms)
+    learner.learn(cam_data, geom_hms, timestamps_ms, poses, controls, flipper_angles, T_horizon_ms, T_segment_ms)
 
 
 if __name__ == '__main__':
