@@ -20,7 +20,7 @@ def read_yaml(path):
     return data
 
 
-def get_cam_data(img_paths, cameras, calib, terrain_encoder_cfg, device='cuda'):
+def get_cam_data(img_paths, cameras, calib, terrain_encoder_cfg, device='cpu'):
     imgs = []
     rots = []
     trans = []
@@ -135,7 +135,7 @@ def get_control_inputs(num_robots, T_horizon):
     return controls, flipper_angles
 
 
-def get_geom_heightmaps(id, device='cuda'):
+def get_geom_heightmaps(ids, device='cpu'):
     height = np.zeros((128, 128))
     mask = np.ones((128, 128))
     hm = np.stack([height, mask], axis=0)
@@ -144,7 +144,7 @@ def get_geom_heightmaps(id, device='cuda'):
 
 
 class Learner:
-    def __init__(self, num_robots, terrain_encoder_cfg, terrain_encoder_weights=None, device='cuda', use_renderer=False):
+    def __init__(self, num_robots, terrain_encoder_cfg, terrain_encoder_weights=None, device='cpu', use_renderer=False):
         self.device = device
         self.use_cuda_graph = True if device == 'cuda' else False
         self.use_renderer = use_renderer
@@ -205,15 +205,18 @@ class Learner:
             self.dphys.init_shoot_states()  # load initial states for the shooter
 
             # predict heightmaps
-            height_pred = self.terrain_encoder(*cam_data).squeeze(1)
+            height_pred = self.terrain_encoder(*[c.clone() for c in cam_data]).squeeze(1)
             # dphysics trajectory loss
             _, loss_traj = self.dphys.simulate_and_backward_torch_tensor(height_pred, use_graph=self.use_cuda_graph)
-            height_pred.backward(height_pred.grad)
             print('loss_traj: ', loss_traj.numpy())
 
             # geometry heightmap loss
             loss_geom = self.geom_hm_loss(height_gt=geom_hms[0:1], height_pred=height_pred, weights=geom_hms[1:2])
-            print('loss_geom: ', loss_geom.item())
+            print('loss_geom: ', loss_geom)
+
+            loss = wp.to_torch(loss_traj) + loss_geom
+            print('loss: ', loss.item())
+            loss.backward(retain_graph=True)
             # loss_geom.backward()
 
             optimizer.step()
@@ -278,7 +281,7 @@ def main():
     controls, flipper_angles = get_control_inputs(num_robots, T_horizon_ms)
 
     # get geometry heightmaps
-    geom_hms = get_geom_heightmaps(id, device=device)
+    geom_hms = get_geom_heightmaps(ids, device=device)
 
     learner = Learner(num_robots=num_robots,
                       terrain_encoder_cfg=terrain_encoder_cfg, terrain_encoder_weights=terrain_encoder_weights,
