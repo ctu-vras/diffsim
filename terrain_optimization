@@ -4,10 +4,9 @@ import torch
 import warp as wp
 import numpy as np
 import os
-from PIL import Image
+from tqdm import tqdm
 from diffsim.src.utils import read_yaml
-from src.data.robingas import compile_data
-from src.utils import sample_augmentation, img_transform, normalize_img, load_calib
+from src.datasets.robingas import compile_data
 from src.models.DiffSim import DiffSim
 from src.models.TerrainEncoder import compile_model
 from torch.utils.tensorboard import SummaryWriter
@@ -106,9 +105,10 @@ class Learner:
 
         log_dir = f'config/tb_runs/{datetime.now().strftime("%Y_%m_%d_%H_%M_%S")}'
         self.tb_writer = SummaryWriter(log_dir=log_dir)
+        self.counter = 0
 
     def init_dataloader(self, batch_size=1):
-        ds = compile_data(seq_i=1, robot='tradr', small=True)
+        ds = compile_data(seq_i=1, robot='tradr', small=False)
         print('Dataset size:', len(ds))
         data_loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
         return data_loader
@@ -154,8 +154,12 @@ class Learner:
         loss = (self.geom_hm_loss_fn(height_pred * weights, height_gt * weights)).mean()
         return loss
 
-    def step(self, imgs_data, hm_geom, i):
+    def step(self, batch):
         self.dphys.init_shoot_states()  # load initial states for the shooter
+
+        batch = [torch.as_tensor(b, dtype=torch.float32, device=self.device) for b in batch]
+        img, rot, tran, intrins, post_rots, post_trans, hm_geom, hm_terrain = batch
+        imgs_data = [img, rot, tran, intrins, post_rots, post_trans]
 
         # predict heightmaps
         height_pred = self.terrain_encoder(*imgs_data).squeeze(1)
@@ -163,16 +167,16 @@ class Learner:
         _, loss_traj = self.dphys.simulate_and_backward_torch_tensor(height_pred, use_graph=self.use_cuda_graph)
         loss_traj = wp.to_torch(loss_traj)
         print('loss_traj: ', loss_traj)
-        self.tb_writer.add_scalar('loss_traj', loss_traj, i)
+        self.tb_writer.add_scalar('loss_traj', loss_traj, self.counter)
 
         # geometry heightmap loss
         loss_geom = self.geom_hm_loss(height_gt=hm_geom[:, 0], height_pred=height_pred, weights=hm_geom[:, 1])
         print('loss_geom: ', loss_geom)
-        self.tb_writer.add_scalar('loss_geom', loss_geom, i)
+        self.tb_writer.add_scalar('loss_geom', loss_geom, self.counter)
 
         loss = loss_geom + loss_traj
         print('loss: ', loss.item())
-        self.tb_writer.add_scalar('loss', loss, i)
+        self.tb_writer.add_scalar('loss', loss, self.counter)
 
         height_pred.backward(height_pred.grad, retain_graph=True)
         loss_geom.backward(retain_graph=True)
@@ -181,18 +185,16 @@ class Learner:
         # necessary, since tape.zero() does not reach the torch tensor for some reason
         self.optimizer.zero_grad(set_to_none=False)
 
-        if self.use_renderer and i % 20 == 0:
+        if self.use_renderer and self.counter % 20 == 0:
             self.dphys.save_shoot_init_vels()  # save states for shooter
             self.dphys.simulate_single()  # simulate a single long trajectory for testing
             self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
             self.dphys.render_simulation(pause=False)
 
-    def learn(self):
-        batch = next(iter(self.data_loader))
-        batch = [torch.as_tensor(b, dtype=torch.float32, device=self.device) for b in batch]
-        img, rot, tran, intrins, post_rots, post_trans, hm_geom, hm_terrain = batch
-        imgs_data = [img, rot, tran, intrins, post_rots, post_trans]
+        # update counter
+        self.counter += 1
 
+    def learn(self):
         # get ground-truth trajectory
         timestamps_ms, poses = get_gt_trajectories(self.batch_size)
         T_horizon_ms = int(timestamps_ms[0][-1])
@@ -202,20 +204,18 @@ class Learner:
         # get control inputs
         controls, flipper_angles = get_control_inputs(self.batch_size, T_horizon_ms)
 
-        # set the simulated time horizon
         self.dphys.set_T(T_horizon_ms, T_segment_ms)
-        # print('setting ground truth trajectories')
         self.dphys.set_target_poses(timestamps_ms, poses)
-        # print('setting controls')
         self.dphys.set_control(controls, flipper_angles)
 
         if self.use_renderer:
             self.dphys.render_heightmaps()
             self.dphys.render_traj(poses[0][:, :3])
 
-        n_iters = 100
-        for i in range(n_iters):
-            self.step(imgs_data, hm_geom, i)
+        # for batch in tqdm(self.data_loader, total=len(self.data_loader)):
+        batch = next(iter(self.data_loader))
+        for _ in range(100):
+            self.step(batch)
 
 
 def main():
@@ -226,7 +226,8 @@ def main():
 
     learner = Learner(batch_size=batch_size,
                       robot=robot,
-                      device=device, use_renderer=use_renderer)
+                      device=device,
+                      use_renderer=use_renderer)
     learner.learn()
 
 

@@ -862,7 +862,7 @@ def compile_data(robot='tradr', seq_i=None, small=False):
     assert os.path.isfile(lss_cfg_path)
     lss_cfg = read_yaml(lss_cfg_path)
 
-    if seq_i:
+    if seq_i is not None:
         path = robingas_seq_paths[robot][seq_i]
     else:
         path = np.random.choice(robingas_seq_paths[robot])

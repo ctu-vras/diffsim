@@ -1,9 +1,9 @@
 import numpy as np
-from ..data.heightmap import Heightmap, eval_heightmap_collisions_shoot
 import warp as wp
 import warp.sim.render
-from ..vis import get_heightmap_vis_ids, generate_force_vis
 from scipy.spatial.transform import Rotation as R
+from ..vis import get_heightmap_vis_ids, generate_force_vis
+from ..heightmap import Heightmap, eval_heightmap_collisions_shoot
 
 
 import sys
