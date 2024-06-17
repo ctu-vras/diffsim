@@ -9,6 +9,8 @@ import yaml
 from src.utils import sample_augmentation, img_transform, normalize_img, load_calib
 from src.models.DiffSim import DiffSim
 from src.models.TerrainEncoder import compile_model
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 wp.init()  # init warp!
@@ -157,6 +159,9 @@ class Learner:
 
         self.geom_hm_loss_fn = torch.nn.MSELoss(reduction='none')
 
+        log_dir = f'config/tb_runs/{datetime.now().strftime("%Y_%m_%d_%H_%M_%S")}'
+        self.tb_writer = SummaryWriter(log_dir=log_dir)
+
     def init_terrain_encoder(self, terrain_encoder_cfg, weights=None):
         terrain_encoder = compile_model(terrain_encoder_cfg['grid_conf'], terrain_encoder_cfg['data_aug_conf'])
         if weights is not None and os.path.exists(weights):
@@ -208,16 +213,21 @@ class Learner:
             height_pred = self.terrain_encoder(*[c.clone() for c in cam_data]).squeeze(1)
             # dphysics trajectory loss
             _, loss_traj = self.dphys.simulate_and_backward_torch_tensor(height_pred, use_graph=self.use_cuda_graph)
-            print('loss_traj: ', loss_traj.numpy())
+            loss_traj = wp.to_torch(loss_traj)
+            print('loss_traj: ', loss_traj)
+            self.tb_writer.add_scalar('loss_traj', loss_traj, i)
 
             # geometry heightmap loss
             loss_geom = self.geom_hm_loss(height_gt=geom_hms[0:1], height_pred=height_pred, weights=geom_hms[1:2])
             print('loss_geom: ', loss_geom)
+            self.tb_writer.add_scalar('loss_geom', loss_geom, i)
 
-            loss = wp.to_torch(loss_traj) + loss_geom
+            loss = loss_geom + loss_traj
             print('loss: ', loss.item())
-            loss.backward(retain_graph=True)
-            # loss_geom.backward()
+            self.tb_writer.add_scalar('loss', loss, i)
+
+            height_pred.backward(height_pred.grad, retain_graph=True)
+            loss_geom.backward(retain_graph=True)
 
             optimizer.step()
             # necessary, since tape.zero() does not reach the torch tensor for some reason
