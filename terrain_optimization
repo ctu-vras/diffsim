@@ -106,10 +106,8 @@ class Learner:
 
     def get_control_inputs(self, T_horizon):
         # define control input for each robot
-        controls0 = 0.2 * np.ones((T_horizon, self.batch_size, 2))
-        flipper_angles0 = np.zeros((T_horizon, self.batch_size, 4))
-        controls = [controls0[:] for _ in range(self.batch_size)]
-        flipper_angles = [flipper_angles0[:] for _ in range(self.batch_size)]
+        controls = 0.2 * np.ones((T_horizon, self.batch_size, 2))
+        flipper_angles = np.zeros((T_horizon, self.batch_size, 4))
 
         return controls, flipper_angles
 
@@ -232,7 +230,7 @@ class Learner:
 
             return fig
 
-    def learn(self):
+    def learn(self, n_iters=1000, n_vis_steps=10):
         # get ground-truth trajectory
         timestamps_ms, poses = self.get_gt_trajectories()
         T_horizon_ms = int(timestamps_ms[0][-1])
@@ -251,10 +249,10 @@ class Learner:
             self.dphys.render_traj(poses[0][:, :3])
 
         batch = next(iter(self.data_loader))
-        for _ in tqdm(range(1000)):
+        for _ in tqdm(range(n_iters)):
             loss, height_pred = self.step(batch)
 
-            if self.counter % 100 == 0:
+            if self.counter % n_vis_steps == 0:
                 print(f'Loss: {loss.item()}')
                 fig = self.vis_pred(batch)
                 self.tb_writer.add_figure('train/prediction', fig, self.counter)
@@ -273,7 +271,7 @@ class Learner:
 def main():
     device = "cuda"
     use_renderer = False
-    batch_size = 1
+    batch_size = 2
     lr=1e-6
     robot = 'tradr'
     lss_weights_path = f'config/weights/lss_robingas_{robot}.pt'
