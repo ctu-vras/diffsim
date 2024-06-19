@@ -20,19 +20,22 @@ wp.init()  # init warp!
 
 
 class Learner:
-    def __init__(self, batch_size, lr=1e-3, weight_decay=1e-7,
-                 robot='tradr', device='cpu', use_renderer=False):
+    def __init__(self, batch_size=1, lr=1e-6, weight_decay=1e-7,
+                 ls_cfg_path='config/lss_cfg.yaml',
+                 lss_weights_path=None,
+                 dphys_cfg_path='config/dphys_cfg.yaml',
+                 device='cpu', use_renderer=False):
         self.device = device
         self.use_cuda_graph = True if device == 'cuda' else False
         self.use_renderer = use_renderer
         self.batch_size = batch_size
 
-        self.lss_cfg = read_yaml(f'config/lss_cfg_{robot}.yaml')
-        self.lss_weights = f'config/weights/lss_robingas_{robot}.pt'
+        self.lss_cfg = read_yaml(ls_cfg_path)
+        self.lss_weights = lss_weights_path
         self.terrain_encoder = self.init_terrain_encoder(self.lss_cfg, weights=self.lss_weights)
 
         self.dphys_cfg = DPhysConfig()
-        self.dphys_cfg.from_yaml('config/dphys_cfg.yaml')
+        self.dphys_cfg.from_yaml(dphys_cfg_path)
         self.dphys = self.init_diff_physics()
 
         self.geom_hm_loss_fn = torch.nn.MSELoss(reduction='none')
@@ -271,10 +274,18 @@ def main():
     device = "cuda"
     use_renderer = False
     batch_size = 1
+    lr=1e-6
     robot = 'tradr'
+    # lss_weights_path = f'config/lss_weights/{robot}_lss_weights.pth'
+    lss_weights_path = None
+    lss_cfg_path = f'config/lss_cfg_{robot}.yaml'
+    dphys_cfg_path = 'config/dphys_cfg.yaml'
 
     learner = Learner(batch_size=batch_size,
-                      robot=robot,
+                      lr=lr,
+                      ls_cfg_path=lss_cfg_path,
+                      lss_weights_path=lss_weights_path,
+                      dphys_cfg_path=dphys_cfg_path,
                       device=device,
                       use_renderer=use_renderer)
     learner.learn()
