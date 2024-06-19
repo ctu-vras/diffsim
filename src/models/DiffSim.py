@@ -336,7 +336,7 @@ class DiffSim:
             self.simulate_flippers_heightmap(t, num_shoots=1)
         self.loss.zero_()  # zero out loss tensor
         self.compute_l2_loss()
-        print('single shoot loss: ', self.loss.numpy())
+        # print('single shoot loss: ', self.loss.numpy())
         return self.body_q
 
     def simulate(self, use_graph=False):

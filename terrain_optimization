@@ -159,12 +159,6 @@ class Learner:
         # necessary, since tape.zero() does not reach the torch tensor for some reason
         self.optimizer.zero_grad(set_to_none=False)
 
-        if self.use_renderer and self.counter % 20 == 0:
-            self.dphys.save_shoot_init_vels()  # save states for shooter
-            self.dphys.simulate_single()  # simulate a single long trajectory for testing
-            self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
-            self.dphys.render_simulation(pause=False)
-
         return loss, height_pred
 
     def vis_pred(self, batch):
@@ -266,6 +260,12 @@ class Learner:
                 self.tb_writer.add_figure('train/prediction', fig, self.counter)
                 self.tb_writer.flush()
 
+                if self.use_renderer:
+                    self.dphys.save_shoot_init_vels()  # save states for shooter
+                    self.dphys.simulate_single()  # simulate a single long trajectory for testing
+                    self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
+                    self.dphys.render_simulation(pause=False)
+
             # update counter
             self.counter += 1
 
@@ -276,8 +276,8 @@ def main():
     batch_size = 1
     lr=1e-6
     robot = 'tradr'
-    # lss_weights_path = f'config/lss_weights/{robot}_lss_weights.pth'
-    lss_weights_path = None
+    lss_weights_path = f'config/weights/lss_robingas_{robot}.pt'
+    # lss_weights_path = None
     lss_cfg_path = f'config/lss_cfg_{robot}.yaml'
     dphys_cfg_path = 'config/dphys_cfg.yaml'
 
