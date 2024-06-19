@@ -4,8 +4,10 @@ import torch
 import warp as wp
 import numpy as np
 import os
+from matplotlib import pyplot as plt
 from tqdm import tqdm
-from diffsim.src.utils import read_yaml
+from src.config import DPhysConfig
+from src.utils import read_yaml, denormalize_img, ego_to_cam, get_only_in_img_mask
 from src.datasets.robingas import compile_data
 from src.models.DiffSim import DiffSim
 from src.models.TerrainEncoder import compile_model
@@ -17,73 +19,6 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 wp.init()  # init warp!
 
 
-def get_gt_trajectories(batch_size):
-    def pose2mat(pose):
-        T = np.eye(4)
-        T[:3, :4] = pose.reshape((3, 4))
-        return T
-
-    def id2stamp(id):
-        sec, nsec = id.split('_')
-        assert len(sec) == 10, 'seconds should have 10 digits'
-        assert len(nsec) == 9, 'nanoseconds should have 9 digits'
-        sec = float(sec)
-        nsec = float(nsec)
-        return sec + nsec * 1e-9
-
-    # define target poses with timestamps for each robot
-    num_poses = 30
-    T_horizon = 5000
-    poses0 = np.zeros((num_poses, 7))
-    poses0[:, 6] = 1  # quaternion w
-    poses0[:, 0] = np.arange(num_poses) / num_poses * 1  # x coordinate
-    poses0[:, 2] = 1.0
-    timesteps0 = (T_horizon * np.arange(num_poses) / num_poses).astype(int)
-    poses_list = [poses0[:] for _ in range(batch_size)]
-    timestamps_list = [timesteps0[:] for _ in range(batch_size)]
-
-    # data = np.loadtxt(poses_path, delimiter=',', skiprows=1)
-    # all_timestamps, Ts = data[:, 0], data[:, 1:13]
-    # lidar_poses = np.asarray([pose2mat(pose) for pose in Ts], dtype=np.float32)
-    # # poses of the robot in the map frame
-    # Tr_robot_lidar = calib['transformations']['T_base_link__os_sensor']['data']
-    # Tr_robot_lidar = np.asarray(Tr_robot_lidar, dtype=np.float32).reshape((4, 4))
-    # Tr_lidar_robot = np.linalg.inv(Tr_robot_lidar)
-    # all_poses = lidar_poses @ Tr_lidar_robot
-    #
-    # poses_list = []
-    # timestamps_list = []
-    # for id in ids:
-    #     stamp = id2stamp(id)
-    #     il = np.argmin(np.abs(all_timestamps - stamp))
-    #     ir = np.clip(il + n_frames, 0, len(all_timestamps))
-    #     poses = all_poses[il:ir]
-    #     timestamps = np.asarray(all_timestamps[il:ir])
-    #     assert len(poses) > 0, f'No poses found for trajectory {id}'
-    #     poses = np.linalg.inv(poses[0]) @ poses
-    #     timestamps -= timestamps[0]
-    #
-    #     # turn poses into quaternions
-    #     xyz = poses[:, :3, 3]
-    #     quats = np.asarray([Rotation.from_matrix(pose[:3, :3]).as_quat() for pose in poses], dtype=np.float32)
-    #     poses = np.concatenate([xyz, quats], axis=1)
-    #     timestamps_ms = timestamps * 1e3
-    #
-    #     poses_list.append(poses)
-    #     timestamps_list.append(timestamps_ms.astype(int))
-
-    return timestamps_list, poses_list
-
-def get_control_inputs(batch_size, T_horizon):
-    # define control input for each robot
-    controls0 = 0.2 * np.ones((T_horizon, batch_size, 2))
-    flipper_angles0 = np.zeros((T_horizon, batch_size, 4))
-    controls = [controls0[:] for _ in range(batch_size)]
-    flipper_angles = [flipper_angles0[:] for _ in range(batch_size)]
-
-    return controls, flipper_angles
-
-
 class Learner:
     def __init__(self, batch_size, lr=1e-3, weight_decay=1e-7,
                  robot='tradr', device='cpu', use_renderer=False):
@@ -92,10 +27,12 @@ class Learner:
         self.use_renderer = use_renderer
         self.batch_size = batch_size
 
-        self.terrain_encoder_cfg = read_yaml(f'config/lss_cfg_{robot}.yaml')
-        self.terrain_encoder_weights = f'config/weights/lss_robingas_{robot}.pt'
-        self.terrain_encoder = self.init_terrain_encoder(self.terrain_encoder_cfg, weights=self.terrain_encoder_weights)
+        self.lss_cfg = read_yaml(f'config/lss_cfg_{robot}.yaml')
+        self.lss_weights = f'config/weights/lss_robingas_{robot}.pt'
+        self.terrain_encoder = self.init_terrain_encoder(self.lss_cfg, weights=self.lss_weights)
 
+        self.dphys_cfg = DPhysConfig()
+        self.dphys_cfg.from_yaml('config/dphys_cfg.yaml')
         self.dphys = self.init_diff_physics()
 
         self.geom_hm_loss_fn = torch.nn.MSELoss(reduction='none')
@@ -128,14 +65,50 @@ class Learner:
         return dphys
 
     def get_initial_heightmaps(self, batch_size):
-        xbound = self.terrain_encoder_cfg['grid_conf']['xbound']
-        ybound = self.terrain_encoder_cfg['grid_conf']['ybound']
+        xbound = self.lss_cfg['grid_conf']['xbound']
+        ybound = self.lss_cfg['grid_conf']['ybound']
         grid_res = xbound[2]
         shp = (int((xbound[1] - xbound[0]) / grid_res), int((ybound[1] - ybound[0]) / grid_res))
         torch_hms = [torch.zeros(shp, dtype=torch.float32, device=self.device, requires_grad=True)
                      for _ in range(batch_size)]
         res = [grid_res for _ in range(batch_size)]  # heightmap resolutions
         return torch_hms, res
+
+    def get_gt_trajectories(self):
+        def pose2mat(pose):
+            T = np.eye(4)
+            T[:3, :4] = pose.reshape((3, 4))
+            return T
+
+        def id2stamp(id):
+            sec, nsec = id.split('_')
+            assert len(sec) == 10, 'seconds should have 10 digits'
+            assert len(nsec) == 9, 'nanoseconds should have 9 digits'
+            sec = float(sec)
+            nsec = float(nsec)
+            return sec + nsec * 1e-9
+
+        # define target poses with timestamps for each robot
+        num_poses = 30
+        T_horizon = 5000
+        poses0 = np.zeros((num_poses, 7))
+        poses0[:, 6] = 1  # quaternion w
+        poses0[:, 0] = np.arange(num_poses) / num_poses * 1  # x coordinate
+        poses0[:, 2] = 1.0
+        timesteps0 = (T_horizon * np.arange(num_poses) / num_poses).astype(int)
+        poses_list = [poses0[:] for _ in range(self.batch_size)]
+        timestamps_list = [timesteps0[:] for _ in range(self.batch_size)]
+
+        return timestamps_list, poses_list
+
+    def get_control_inputs(self, T_horizon):
+        # define control input for each robot
+        controls0 = 0.2 * np.ones((T_horizon, self.batch_size, 2))
+        flipper_angles0 = np.zeros((T_horizon, self.batch_size, 4))
+        controls = [controls0[:] for _ in range(self.batch_size)]
+        flipper_angles = [flipper_angles0[:] for _ in range(self.batch_size)]
+
+        return controls, flipper_angles
 
     def geom_hm_loss(self, height_pred, height_gt, weights=None):
         assert height_pred.shape == height_gt.shape, 'Height prediction and ground truth must have the same shape'
@@ -154,7 +127,7 @@ class Learner:
         loss = (self.geom_hm_loss_fn(height_pred * weights, height_gt * weights)).mean()
         return loss
 
-    def step(self, batch):
+    def step(self, batch, max_grad_norm=5.0):
         self.dphys.init_shoot_states()  # load initial states for the shooter
 
         batch = [torch.as_tensor(b, dtype=torch.float32, device=self.device) for b in batch]
@@ -166,21 +139,19 @@ class Learner:
         # dphysics trajectory loss
         _, loss_traj = self.dphys.simulate_and_backward_torch_tensor(height_pred, use_graph=self.use_cuda_graph)
         loss_traj = wp.to_torch(loss_traj)
-        print('loss_traj: ', loss_traj)
         self.tb_writer.add_scalar('loss_traj', loss_traj, self.counter)
 
         # geometry heightmap loss
         loss_geom = self.geom_hm_loss(height_gt=hm_geom[:, 0], height_pred=height_pred, weights=hm_geom[:, 1])
-        print('loss_geom: ', loss_geom)
         self.tb_writer.add_scalar('loss_geom', loss_geom, self.counter)
 
         loss = loss_geom + loss_traj
-        print('loss: ', loss.item())
         self.tb_writer.add_scalar('loss', loss, self.counter)
 
         height_pred.backward(height_pred.grad, retain_graph=True)
         loss_geom.backward(retain_graph=True)
 
+        torch.nn.utils.clip_grad_norm_(self.terrain_encoder.parameters(), max_grad_norm)
         self.optimizer.step()
         # necessary, since tape.zero() does not reach the torch tensor for some reason
         self.optimizer.zero_grad(set_to_none=False)
@@ -191,18 +162,88 @@ class Learner:
             self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
             self.dphys.render_simulation(pause=False)
 
-        # update counter
-        self.counter += 1
+        return loss, height_pred
+
+    def vis_pred(self, batch):
+        fig = plt.figure(figsize=(20, 12))
+        ax1 = fig.add_subplot(341)
+        ax2 = fig.add_subplot(342)
+        ax3 = fig.add_subplot(343)
+        ax4 = fig.add_subplot(344)
+        ax5 = fig.add_subplot(345)
+        ax6 = fig.add_subplot(346)
+        ax7 = fig.add_subplot(347)
+        ax8 = fig.add_subplot(348)
+        ax9 = fig.add_subplot(349)
+
+        axes = [ax1, ax2, ax3, ax4, ax5, ax6, ax7, ax8, ax9]
+        for ax in axes:
+            ax.clear()
+
+        # visualize training predictions
+        with torch.no_grad():
+            imgs, rots, trans, intrins, post_rots, post_trans, hm_geom, hm_terrain = batch
+            inputs = [imgs, rots, trans, intrins, post_rots, post_trans]
+            inputs = [torch.as_tensor(i, dtype=torch.float32, device=self.device) for i in inputs]
+            voxel_feats = self.terrain_encoder.get_voxels(*inputs)
+            height_pred_geom, height_pred_diff = self.terrain_encoder.bevencode(voxel_feats)
+            height_pred_terrain = height_pred_geom - height_pred_diff
+
+            batchi = 0
+            height_pred_geom = height_pred_geom[batchi, 0].cpu()
+            height_pred_terrain = height_pred_terrain[batchi, 0].cpu()
+            height_pred_diff = height_pred_diff[batchi, 0].cpu()
+            height_geom = hm_geom[batchi, 0].cpu()
+            height_terrain = hm_terrain[batchi, 0].cpu()
+
+            # get height map points
+            z_grid = height_pred_terrain
+            x_grid = torch.arange(-self.dphys_cfg.d_max, self.dphys_cfg.d_max, self.dphys_cfg.grid_res)
+            y_grid = torch.arange(-self.dphys_cfg.d_max, self.dphys_cfg.d_max, self.dphys_cfg.grid_res)
+            x_grid, y_grid = torch.meshgrid(x_grid, y_grid)
+            hm_points = torch.stack([x_grid, y_grid, z_grid], dim=-1)
+            hm_points = hm_points.view(-1, 3).T
+
+            # plot images with projected height map points
+            for imgi in range(imgs.shape[1])[:4]:
+                ax = axes[imgi]
+                img = imgs[batchi, imgi]
+                img = denormalize_img(img[:3])
+                cam_pts = ego_to_cam(hm_points, rots[batchi, imgi], trans[batchi, imgi], intrins[batchi, imgi])
+                img_H, img_W = self.lss_cfg['data_aug_conf']['H'], self.lss_cfg['data_aug_conf']['W']
+                mask_img = get_only_in_img_mask(cam_pts, img_H, img_W)
+                plot_pts = post_rots[batchi, imgi].matmul(cam_pts) + post_trans[batchi, imgi].unsqueeze(1)
+                ax.imshow(img)
+                ax.scatter(plot_pts[0, mask_img], plot_pts[1, mask_img], s=1, c=hm_points[2, mask_img],
+                           cmap='jet', vmin=-1.0, vmax=1.0)
+                ax.axis('off')
+
+            ax5.set_title('Prediction: Geom')
+            ax5.imshow(height_pred_geom.T, origin='lower', cmap='jet', vmin=-1.0, vmax=1.0)
+
+            ax6.set_title('Label: Geom')
+            ax6.imshow(height_geom.T, origin='lower', cmap='jet', vmin=-1.0, vmax=1.0)
+
+            ax7.set_title('Prediction: Terrain')
+            ax7.imshow(height_pred_terrain.T, origin='lower', cmap='jet', vmin=-1.0, vmax=1.0)
+
+            ax8.set_title('Label: Terrain')
+            ax8.imshow(height_terrain.T, origin='lower', cmap='jet', vmin=-1.0, vmax=1.0)
+
+            ax9.set_title('Prediction: HM Diff')
+            ax9.imshow(height_pred_diff.T, origin='lower', cmap='jet', vmin=-1.0, vmax=1.0)
+
+            return fig
 
     def learn(self):
         # get ground-truth trajectory
-        timestamps_ms, poses = get_gt_trajectories(self.batch_size)
+        timestamps_ms, poses = self.get_gt_trajectories()
         T_horizon_ms = int(timestamps_ms[0][-1])
         T_segment_ms = 300
         print('T_horizon_ms: ', T_horizon_ms)
 
         # get control inputs
-        controls, flipper_angles = get_control_inputs(self.batch_size, T_horizon_ms)
+        controls, flipper_angles = self.get_control_inputs(T_horizon_ms)
 
         self.dphys.set_T(T_horizon_ms, T_segment_ms)
         self.dphys.set_target_poses(timestamps_ms, poses)
@@ -212,15 +253,23 @@ class Learner:
             self.dphys.render_heightmaps()
             self.dphys.render_traj(poses[0][:, :3])
 
-        # for batch in tqdm(self.data_loader, total=len(self.data_loader)):
         batch = next(iter(self.data_loader))
-        for _ in range(100):
-            self.step(batch)
+        for _ in tqdm(range(1000)):
+            loss, height_pred = self.step(batch)
+
+            if self.counter % 100 == 0:
+                print(f'Loss: {loss.item()}')
+                fig = self.vis_pred(batch)
+                self.tb_writer.add_figure('train/prediction', fig, self.counter)
+                self.tb_writer.flush()
+
+            # update counter
+            self.counter += 1
 
 
 def main():
     device = "cuda"
-    use_renderer = True
+    use_renderer = False
     batch_size = 1
     robot = 'tradr'
 

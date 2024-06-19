@@ -854,9 +854,9 @@ class RobinGasPoints(RobinGas):
 
 def compile_data(robot='tradr', seq_i=None, small=False):
     dphys_cfg = DPhysConfig()
-    config_path = os.path.join(data_dir, '../config/dphys_cfg.yaml')
-    assert os.path.isfile(config_path), 'Config file %s does not exist' % config_path
-    dphys_cfg.from_yaml(config_path)
+    dphys_cfg_path = os.path.join(data_dir, '../config/dphys_cfg.yaml')
+    assert os.path.isfile(dphys_cfg_path), 'Config file %s does not exist' % dphys_cfg_path
+    dphys_cfg.from_yaml(dphys_cfg_path)
 
     lss_cfg_path = os.path.join(data_dir, f'../config/lss_cfg_{robot}.yaml')
     assert os.path.isfile(lss_cfg_path)
