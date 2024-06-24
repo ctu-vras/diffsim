@@ -42,16 +42,16 @@ class Learner:
         self.geom_hm_loss_fn = torch.nn.MSELoss(reduction='none')
         self.optimizer = torch.optim.Adam(self.terrain_encoder.parameters(), lr=lr, weight_decay=weight_decay)
 
-        self.data_loader = self.init_dataloader(batch_size=batch_size)
+        self.data_loader = self.init_dataloader(batch_size=batch_size, shuffle=True)
 
         log_dir = f'config/tb_runs/{datetime.now().strftime("%Y_%m_%d_%H_%M_%S")}'
         self.tb_writer = SummaryWriter(log_dir=log_dir)
         self.counter = 0
 
-    def init_dataloader(self, batch_size=1):
-        ds = compile_data(seq_i=1, robot='tradr', small=False)
+    def init_dataloader(self, **kwargs):
+        ds = compile_data(robot='tradr')
         print('Dataset size:', len(ds))
-        data_loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
+        data_loader = DataLoader(ds, **kwargs)
         return data_loader
 
     def init_terrain_encoder(self, terrain_encoder_cfg, weights=None):
@@ -242,6 +242,7 @@ class Learner:
         T_segment_ms = 300
 
         # get control inputs
+        # TODO: GT controls from dataset
         controls, flipper_angles = self.get_control_inputs(T_horizon_ms)
 
         self.dphys.set_T(T_horizon_ms, T_segment_ms)
@@ -252,6 +253,7 @@ class Learner:
             self.dphys.render_heightmaps()
             self.dphys.render_traj(poses[0, :, :3].cpu().numpy())
 
+        # TODO: train with multiple batches
         for _ in tqdm(range(n_iters)):
             loss, height_pred = self.step(batch)
 
@@ -277,8 +279,8 @@ def main():
     batch_size = 1
     lr = 1e-6
     robot = 'tradr'
-    lss_weights_path = f'config/weights/lss_robingas_{robot}.pt'
-    # lss_weights_path = None
+    # lss_weights_path = f'config/weights/lss_robingas_{robot}.pt'
+    lss_weights_path = None
     lss_cfg_path = f'config/lss_cfg_{robot}.yaml'
     dphys_cfg_path = 'config/dphys_cfg.yaml'
 
