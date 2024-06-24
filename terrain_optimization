@@ -5,9 +5,10 @@ import warp as wp
 import numpy as np
 import os
 from matplotlib import pyplot as plt
+from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 from src.config import DPhysConfig
-from src.utils import read_yaml, denormalize_img, ego_to_cam, get_only_in_img_mask
+from src.utils import read_yaml, denormalize_img, ego_to_cam, get_only_in_img_mask, load_calib
 from src.datasets.robingas import compile_data
 from src.models.DiffSim import DiffSim
 from src.models.TerrainEncoder import compile_model
@@ -77,33 +78,6 @@ class Learner:
         res = [grid_res for _ in range(batch_size)]  # heightmap resolutions
         return torch_hms, res
 
-    def get_gt_trajectories(self):
-        def pose2mat(pose):
-            T = np.eye(4)
-            T[:3, :4] = pose.reshape((3, 4))
-            return T
-
-        def id2stamp(id):
-            sec, nsec = id.split('_')
-            assert len(sec) == 10, 'seconds should have 10 digits'
-            assert len(nsec) == 9, 'nanoseconds should have 9 digits'
-            sec = float(sec)
-            nsec = float(nsec)
-            return sec + nsec * 1e-9
-
-        # define target poses with timestamps for each robot
-        num_poses = 30
-        T_horizon = 5000
-        poses0 = np.zeros((num_poses, 7))
-        poses0[:, 6] = 1  # quaternion w
-        poses0[:, 0] = np.arange(num_poses) / num_poses * 1  # x coordinate
-        poses0[:, 2] = 1.0
-        timesteps0 = (T_horizon * np.arange(num_poses) / num_poses).astype(int)
-        poses_list = [poses0[:] for _ in range(self.batch_size)]
-        timestamps_list = [timesteps0[:] for _ in range(self.batch_size)]
-
-        return timestamps_list, poses_list
-
     def get_control_inputs(self, T_horizon):
         # define control input for each robot
         controls = 0.2 * np.ones((T_horizon, self.batch_size, 2))
@@ -132,14 +106,14 @@ class Learner:
         self.dphys.init_shoot_states()  # load initial states for the shooter
 
         batch = [torch.as_tensor(b, dtype=torch.float32, device=self.device) for b in batch]
-        img, rot, tran, intrins, post_rots, post_trans, hm_geom, hm_terrain = batch
+        img, rot, tran, intrins, post_rots, post_trans, hm_geom, hm_terrain, stamps, poses = batch
         imgs_data = [img, rot, tran, intrins, post_rots, post_trans]
 
         # predict heightmaps
         height_pred = self.terrain_encoder(*imgs_data).squeeze(1)
         # dphysics trajectory loss
         _, loss_traj = self.dphys.simulate_and_backward_torch_tensor(height_pred, use_graph=self.use_cuda_graph)
-        loss_traj = wp.to_torch(loss_traj)
+        loss_traj = wp.to_torch(loss_traj) / self.batch_size
         self.tb_writer.add_scalar('loss_traj', loss_traj, self.counter)
 
         # geometry heightmap loss
@@ -177,7 +151,7 @@ class Learner:
 
         # visualize training predictions
         with torch.no_grad():
-            imgs, rots, trans, intrins, post_rots, post_trans, hm_geom, hm_terrain = batch
+            imgs, rots, trans, intrins, post_rots, post_trans, hm_geom, hm_terrain, stamps, poses = batch
             inputs = [imgs, rots, trans, intrins, post_rots, post_trans]
             inputs = [torch.as_tensor(i, dtype=torch.float32, device=self.device) for i in inputs]
             voxel_feats = self.terrain_encoder.get_voxels(*inputs)
@@ -230,25 +204,54 @@ class Learner:
 
             return fig
 
-    def learn(self, n_iters=1000, n_vis_steps=10):
+    def test_control(self):
         # get ground-truth trajectory
-        timestamps_ms, poses = self.get_gt_trajectories()
+        batch = next(iter(self.data_loader))
+        img, rot, tran, intrins, post_rots, post_trans, hm_geom, hm_terrain, stamps, poses = batch
+        poses[:, :, 2] += 1.0  # add height offset
+
+        # get ground-truth trajectory
+        timestamps_ms = stamps * 1000
         T_horizon_ms = int(timestamps_ms[0][-1])
         T_segment_ms = 300
-        print('T_horizon_ms: ', T_horizon_ms)
 
         # get control inputs
         controls, flipper_angles = self.get_control_inputs(T_horizon_ms)
 
         self.dphys.set_T(T_horizon_ms, T_segment_ms)
         self.dphys.set_target_poses(timestamps_ms, poses)
-        self.dphys.set_control(controls, flipper_angles)
+        self.dphys.set_controls(controls, flipper_angles)
+
+        self.dphys.render_heightmaps()
+        self.dphys.render_traj(poses[0, :, :3].cpu().numpy())
+
+        self.dphys.init_shoot_states()  # load initial states for the shooter
+        self.dphys.save_shoot_init_vels()  # save states for shooter
+        self.dphys.simulate_single()  # simulate a single long trajectory for testing
+        self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
+        self.dphys.render_simulation(pause=False)
+
+    def learn(self, n_iters=1000, n_vis_steps=10):
+        batch = next(iter(self.data_loader))
+        img, rot, tran, intrins, post_rots, post_trans, hm_geom, hm_terrain, stamps, poses = batch
+        poses[:, :, 2] += 1.0  # add height offset
+
+        # get ground-truth trajectory
+        timestamps_ms = stamps * 1000
+        T_horizon_ms = int(timestamps_ms[0][-1])
+        T_segment_ms = 300
+
+        # get control inputs
+        controls, flipper_angles = self.get_control_inputs(T_horizon_ms)
+
+        self.dphys.set_T(T_horizon_ms, T_segment_ms)
+        self.dphys.set_target_poses(timestamps_ms, poses)
+        self.dphys.set_controls(controls, flipper_angles)
 
         if self.use_renderer:
             self.dphys.render_heightmaps()
-            self.dphys.render_traj(poses[0][:, :3])
+            self.dphys.render_traj(poses[0, :, :3].cpu().numpy())
 
-        batch = next(iter(self.data_loader))
         for _ in tqdm(range(n_iters)):
             loss, height_pred = self.step(batch)
 
@@ -271,8 +274,8 @@ class Learner:
 def main():
     device = "cuda"
     use_renderer = False
-    batch_size = 2
-    lr=1e-6
+    batch_size = 1
+    lr = 1e-6
     robot = 'tradr'
     lss_weights_path = f'config/weights/lss_robingas_{robot}.pt'
     # lss_weights_path = None
@@ -287,6 +290,7 @@ def main():
                       device=device,
                       use_renderer=use_renderer)
     learner.learn()
+    # learner.test_control()
 
 
 if __name__ == '__main__':

@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torchvision
 from scipy.interpolate import griddata
+from scipy.spatial.transform import Rotation
 from skimage.draw import polygon
 from torch.utils.data import Dataset
 from ..utils import img_transform, normalize_img, ego_to_cam, get_only_in_img_mask, sample_augmentation
@@ -19,7 +20,6 @@ import open3d as o3d
 __all__ = [
     'data_dir',
     'RobinGas',
-    'RobinGasPoints',
     'robingas_seq_paths',
 ]
 
@@ -308,7 +308,7 @@ class RobinGasBase(Dataset):
             cams.remove('camera_up')
         return sorted(cams)
 
-    def get_traj(self, i, n_frames=100):
+    def get_traj(self, i, n_frames=10, xyz_quat=False):
         # n_frames equals to the number of future poses (trajectory length)
         ind = self.ids[i]
         Tr_robot_lidar = self.calib['transformations']['T_base_link__os_sensor']['data']
@@ -334,53 +334,18 @@ class RobinGasBase(Dataset):
                 poses = all_poses[il:ir]
                 stamps = np.asarray(copy.copy(self.ts[il:ir]))
             assert len(poses) > 0, f'No poses found for trajectory {ind}'
-            poses = np.linalg.inv(poses[0]) @ poses
 
-        traj = {
-            'stamps': stamps, 'poses': poses,
-        }
+        # initialize at the origin
+        poses = np.linalg.inv(poses[0]) @ poses
+        stamps = stamps - stamps[0]
 
-        return traj
+        if xyz_quat:
+            # convert to xyz and quaternion
+            xyz = poses[:, :3, 3]
+            quats = np.asarray([Rotation.from_matrix(pose[:3, :3]).as_quat() for pose in poses], dtype=np.float32)
+            poses = np.concatenate([xyz, quats], axis=1)
 
-    def get_states_traj(self, i, start_from_zero=False):
-        traj = self.get_traj(i)
-        poses = traj['poses']
-
-        if start_from_zero:
-            # transform poses to the same coordinate frame as the height map
-            Tr = np.linalg.inv(poses[0])
-            poses = np.asarray([np.matmul(Tr, p) for p in poses])
-            poses[:, 2, 3] -= self.calib['clearance']
-            # count time from 0
-            tstamps = traj['stamps']
-            tstamps = tstamps - tstamps[0]
-
-        poses = np.asarray(poses, dtype=np.float32)
-        tstamps = np.asarray(tstamps, dtype=np.float32)
-
-        xyz = torch.as_tensor(poses[:, :3, 3])
-        rot = torch.as_tensor(poses[:, :3, :3])
-
-        n_states = len(xyz)
-        tt = torch.tensor(tstamps)[None].T
-
-        dps = torch.diff(xyz, dim=0)
-        dt = torch.diff(tt, dim=0)
-        theta = torch.atan2(dps[:, 1], dps[:, 0]).view(-1, 1)
-        theta = torch.cat([theta[:1], theta], dim=0)
-
-        vel = torch.zeros_like(xyz)
-        vel[:-1] = dps / dt
-        omega = torch.zeros_like(xyz)
-        omega[:-1, 2:3] = torch.diff(theta, dim=0) / dt  # + torch.diff(angles, dim=0)[:, 2:3] / dt
-
-        forces = torch.zeros((n_states, 3, 10))
-        states = (xyz.view(n_states, 3, 1),
-                  rot.view(n_states, 3, 3),
-                  vel.view(n_states, 3, 1),
-                  omega.view(n_states, 3, 1),
-                  forces.view(n_states, 3, 10))
-        return states
+        return stamps, poses
 
     def get_raw_cloud(self, i):
         ind = self.ids[i]
@@ -451,8 +416,7 @@ class RobinGasBase(Dataset):
 
         Tr_base_link__base_footprint = np.asarray(self.calib['transformations']['T_base_link__base_footprint']['data'],
                                                   dtype=float).reshape((4, 4))
-        traj = self.get_traj(i)
-        poses = traj['poses']
+        stamps, poses = self.get_traj(i)
         poses_footprint = poses @ Tr_base_link__base_footprint
 
         trajectory_points = []
@@ -473,9 +437,9 @@ class RobinGasBase(Dataset):
 
     def get_sample(self, i):
         cloud = self.get_cloud(i)
-        traj = self.get_traj(i)
+        stamps, poses = self.get_traj(i)
         height = self.estimate_heightmap(position(cloud), fill_value=0.)
-        return cloud, traj, height
+        return cloud, stamps, poses, height
 
     def __getitem__(self, i):
         if isinstance(i, (int, np.int64)):
@@ -761,7 +725,7 @@ class RobinGas(RobinGasBase):
                 height = height[int(H // 2 - h // 2):int(H // 2 + h // 2),
                                 int(W // 2 - w // 2):int(W // 2 + w // 2)]
             # poses in grid coordinates
-            poses = self.get_traj(i)['poses']
+            stamps, poses = self.get_traj(i)
             poses_grid = poses[:, :2, 3] / self.dphys_cfg.grid_res + np.asarray([w / 2, h / 2])
             poses_grid = poses_grid.astype(int)
             # crop poses to observation area defined by square grid
@@ -826,30 +790,12 @@ class RobinGas(RobinGasBase):
         img, rot, tran, intrins, post_rots, post_trans = self.get_images_data(i)
         hm_geom = self.get_geom_height_map(i)
         hm_terrain = self.get_terrain_height_map(i)
+        stamps, poses = self.get_traj(i, n_frames=10, xyz_quat=True)
         if self.only_front_cam:
             mask = self.front_height_map_mask()
             hm_geom[1] = hm_geom[1] * torch.from_numpy(mask)
             hm_terrain[1] = hm_terrain[1] * torch.from_numpy(mask)
-        return img, rot, tran, intrins, post_rots, post_trans, hm_geom, hm_terrain
-
-
-class RobinGasPoints(RobinGas):
-    def __init__(self, path, lss_cfg, dphys_cfg=DPhysConfig(), is_train=True, only_front_cam=False, points_source='lidar'):
-        super(RobinGasPoints, self).__init__(path, lss_cfg,
-                                             dphys_cfg=dphys_cfg, is_train=is_train, only_front_cam=only_front_cam)
-        assert points_source in ['lidar', 'radar', 'lidar_radar']
-        self.points_source = points_source
-
-    def get_sample(self, i):
-        imgs, rots, trans, intrins, post_rots, post_trans = self.get_images_data(i)
-        hm_geom = self.get_geom_height_map(i, points_source=self.points_source)
-        hm_terrain = self.get_terrain_height_map(i, points_source=self.points_source)
-        if self.only_front_cam:
-            mask = self.front_height_map_mask()
-            hm_geom[1] = hm_geom[1] * torch.from_numpy(mask)
-            hm_terrain[1] = hm_terrain[1] * torch.from_numpy(mask)
-        points = torch.as_tensor(position(self.get_cloud(i, points_source=self.points_source))).T
-        return imgs, rots, trans, intrins, post_rots, post_trans, hm_geom, hm_terrain, points
+        return img, rot, tran, intrins, post_rots, post_trans, hm_geom, hm_terrain, stamps, poses
 
 
 def compile_data(robot='tradr', seq_i=None, small=False):
