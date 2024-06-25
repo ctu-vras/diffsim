@@ -5,10 +5,9 @@ import warp as wp
 import numpy as np
 import os
 from matplotlib import pyplot as plt
-from scipy.spatial.transform import Rotation
 from tqdm import tqdm
 from src.config import DPhysConfig
-from src.utils import read_yaml, denormalize_img, ego_to_cam, get_only_in_img_mask, load_calib
+from src.utils import read_yaml, denormalize_img, ego_to_cam, get_only_in_img_mask
 from src.datasets.robingas import compile_data
 from src.models.DiffSim import DiffSim
 from src.models.TerrainEncoder import compile_model
@@ -78,13 +77,6 @@ class Learner:
         res = [grid_res for _ in range(batch_size)]  # heightmap resolutions
         return torch_hms, res
 
-    def get_control_inputs(self, T_horizon):
-        # define control input for each robot
-        controls = 0.2 * np.ones((T_horizon, self.batch_size, 2))
-        flipper_angles = np.zeros((T_horizon, self.batch_size, 4))
-
-        return controls, flipper_angles
-
     def geom_hm_loss(self, height_pred, height_gt, weights=None):
         assert height_pred.shape == height_gt.shape, 'Height prediction and ground truth must have the same shape'
         if weights is None:
@@ -102,26 +94,35 @@ class Learner:
         loss = (self.geom_hm_loss_fn(height_pred * weights, height_gt * weights)).mean()
         return loss
 
+    def traj_loss(self, height_pred):
+        _, loss_traj = self.dphys.simulate_and_backward_torch_tensor(height_pred, use_graph=self.use_cuda_graph)
+        loss_traj = wp.to_torch(loss_traj) / self.batch_size
+        return loss_traj
+
     def step(self, batch, max_grad_norm=5.0):
         self.dphys.init_shoot_states()  # load initial states for the shooter
 
         batch = [torch.as_tensor(b, dtype=torch.float32, device=self.device) for b in batch]
-        img, rot, tran, intrins, post_rots, post_trans, hm_geom, hm_terrain, stamps, poses = batch
-        imgs_data = [img, rot, tran, intrins, post_rots, post_trans]
+        (imgs, rots, trans, intrins, post_rots, post_trans,
+         hm_geom, hm_terrain,
+         pose_stamps, poses,
+         control_stamps, controls) = batch
+        imgs_data = [imgs, rots, trans, intrins, post_rots, post_trans]
 
         # predict heightmaps
         height_pred = self.terrain_encoder(*imgs_data).squeeze(1)
         # dphysics trajectory loss
-        _, loss_traj = self.dphys.simulate_and_backward_torch_tensor(height_pred, use_graph=self.use_cuda_graph)
-        loss_traj = wp.to_torch(loss_traj) / self.batch_size
-        self.tb_writer.add_scalar('loss_traj', loss_traj, self.counter)
+        loss_traj = self.traj_loss(height_pred)
+        self.tb_writer.add_scalar('loss/traj', loss_traj, self.counter)
+        print(f'Loss traj: {loss_traj.item()}', flush=True)
 
         # geometry heightmap loss
         loss_geom = self.geom_hm_loss(height_gt=hm_geom[:, 0], height_pred=height_pred, weights=hm_geom[:, 1])
-        self.tb_writer.add_scalar('loss_geom', loss_geom, self.counter)
+        self.tb_writer.add_scalar('loss/geom', loss_geom, self.counter)
+        # print(f'Loss geom: {loss_geom.item()}', flush=True)
 
         loss = loss_geom + loss_traj
-        self.tb_writer.add_scalar('loss', loss, self.counter)
+        self.tb_writer.add_scalar('loss/total', loss, self.counter)
 
         height_pred.backward(height_pred.grad, retain_graph=True)
         loss_geom.backward(retain_graph=True)
@@ -151,7 +152,10 @@ class Learner:
 
         # visualize training predictions
         with torch.no_grad():
-            imgs, rots, trans, intrins, post_rots, post_trans, hm_geom, hm_terrain, stamps, poses = batch
+            (imgs, rots, trans, intrins, post_rots, post_trans,
+             hm_geom, hm_terrain,
+             pose_stamps, poses,
+             control_stamps, controls) = batch
             inputs = [imgs, rots, trans, intrins, post_rots, post_trans]
             inputs = [torch.as_tensor(i, dtype=torch.float32, device=self.device) for i in inputs]
             voxel_feats = self.terrain_encoder.get_voxels(*inputs)
@@ -205,48 +209,53 @@ class Learner:
             return fig
 
     def test_control(self):
-        # get ground-truth trajectory
-        batch = next(iter(self.data_loader))
-        img, rot, tran, intrins, post_rots, post_trans, hm_geom, hm_terrain, stamps, poses = batch
-        poses[:, :, 2] += 1.0  # add height offset
+        for _ in range(5):
+            with torch.no_grad():
+                # get ground-truth trajectory
+                batch = next(iter(self.data_loader))
+                (imgs, rots, trans, intrins, post_rots, post_trans,
+                 hm_geom, hm_terrain,
+                 pose_stamps, poses,
+                 control_stamps, controls) = batch
 
-        # get ground-truth trajectory
-        timestamps_ms = stamps * 1000
-        T_horizon_ms = int(timestamps_ms[0][-1])
-        T_segment_ms = 300
+                controls = controls.transpose(1, 0)  # [B, T, C] -> [T, B, C]
+                flipper_angles = torch.zeros((controls.shape[0], self.batch_size, 4))
+                poses[:, :, 2] += 1.0  # add height offset
 
-        # get control inputs
-        controls, flipper_angles = self.get_control_inputs(T_horizon_ms)
+                T_horizon_ms = max(pose_stamps[:, -1].max(), control_stamps[:, -1].max()) * 1000
+                T_horizon_ms = int(np.round(T_horizon_ms))
+                T_segment_ms = 300
 
-        self.dphys.set_T(T_horizon_ms, T_segment_ms)
-        self.dphys.set_target_poses(timestamps_ms, poses)
-        self.dphys.set_controls(controls, flipper_angles)
+                self.dphys.set_T(T_horizon_ms, T_segment_ms)
+                self.dphys.set_target_poses(pose_stamps * 1000, poses)
+                self.dphys.set_controls(controls, flipper_angles)
 
-        self.dphys.render_heightmaps()
-        self.dphys.render_traj(poses[0, :, :3].cpu().numpy())
+                self.dphys.render_heightmaps()
+                self.dphys.render_traj(poses[0, :, :3].cpu().numpy())
 
-        self.dphys.init_shoot_states()  # load initial states for the shooter
-        self.dphys.save_shoot_init_vels()  # save states for shooter
-        self.dphys.simulate_single()  # simulate a single long trajectory for testing
-        self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
-        self.dphys.render_simulation(pause=False)
+                self.dphys.init_shoot_states()  # load initial states for the shooter
+                self.dphys.save_shoot_init_vels()  # save states for shooter
+                self.dphys.simulate_single()  # simulate a single long trajectory for testing
+                self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
+                self.dphys.render_simulation(pause=False)
 
     def learn(self, n_iters=1000, n_vis_steps=10):
         batch = next(iter(self.data_loader))
-        img, rot, tran, intrins, post_rots, post_trans, hm_geom, hm_terrain, stamps, poses = batch
+        (imgs, rots, trans, intrins, post_rots, post_trans,
+         hm_geom, hm_terrain,
+         pose_stamps, poses,
+         control_stamps, controls) = batch
+
+        controls = controls.transpose(1, 0)  # [B, T, C] -> [T, B, C]
+        flipper_angles = torch.zeros((controls.shape[0], self.batch_size, 4))
         poses[:, :, 2] += 1.0  # add height offset
 
-        # get ground-truth trajectory
-        timestamps_ms = stamps * 1000
-        T_horizon_ms = int(timestamps_ms[0][-1])
+        T_horizon_ms = max(pose_stamps[:, -1].max(), control_stamps[:, -1].max()) * 1000
+        T_horizon_ms = int(np.round(T_horizon_ms))
         T_segment_ms = 300
 
-        # get control inputs
-        # TODO: GT controls from dataset
-        controls, flipper_angles = self.get_control_inputs(T_horizon_ms)
-
         self.dphys.set_T(T_horizon_ms, T_segment_ms)
-        self.dphys.set_target_poses(timestamps_ms, poses)
+        self.dphys.set_target_poses(pose_stamps * 1000, poses)
         self.dphys.set_controls(controls, flipper_angles)
 
         if self.use_renderer:

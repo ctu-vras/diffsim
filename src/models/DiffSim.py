@@ -321,7 +321,10 @@ class DiffSim:
         self.shoot_init_vels = wp.zeros((self.num_shoots, self.sim_robots), dtype=wp.spatial_vectorf, device=self.device)
 
     def set_controls(self, controls, flipper_angles=None):
-        '''given timestamped track controls and initial time of trajectory, parse the controls into simulation ready warp array'''
+        """
+        given timestamped track controls and initial time of trajectory,
+        parse the controls into simulation ready warp array
+        """
         self.track_velocities.assign(controls)
         if flipper_angles is not None:
             self.flipper_angles.assign(flipper_angles)

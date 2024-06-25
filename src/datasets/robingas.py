@@ -264,6 +264,7 @@ class RobinGasBase(Dataset):
         # assert os.path.exists(self.traj_path)
         self.calib_path = os.path.join(path, 'calibration')
         # assert os.path.exists(self.calib_path)
+        self.controls_path = os.path.join(path, 'controls', 'tracks_vel.csv')
         self.dphys_cfg = dphys_cfg
         self.calib = load_calib(calib_path=self.calib_path)
         self.ids = self.get_ids()
@@ -308,7 +309,7 @@ class RobinGasBase(Dataset):
             cams.remove('camera_up')
         return sorted(cams)
 
-    def get_traj(self, i, n_frames=10, xyz_quat=False):
+    def get_traj(self, i, T_horizon=10.0, xyz_quat=False):
         # n_frames equals to the number of future poses (trajectory length)
         ind = self.ids[i]
         Tr_robot_lidar = self.calib['transformations']['T_base_link__os_sensor']['data']
@@ -325,12 +326,18 @@ class RobinGasBase(Dataset):
             # get trajectory as sequence of `n_frames` future poses
             all_poses = self.get_poses(return_stamps=False)
             all_ids = list(self.get_ids())
-            il = all_ids.index(ind)
-            if n_frames is None:
+            all_times = list(self.ts)
+            assert len(all_poses) == len(all_ids) == len(all_times)
+            if T_horizon is None:
                 poses = copy.copy(all_poses)
                 stamps = np.asarray(copy.copy(self.ts), dtype=np.float32)
             else:
-                ir = np.clip(il + n_frames, 0, len(all_ids))
+                il = all_ids.index(ind)
+                time_left = self.ts[il]
+                time_right = time_left + T_horizon
+                # find the closest index to the right in all times
+                ir = np.argmin(np.abs(np.asarray(all_times) - time_right))
+                ir = np.clip(ir, 0, len(all_poses) - 1)
                 poses = all_poses[il:ir]
                 stamps = np.asarray(copy.copy(self.ts[il:ir]))
             assert len(poses) > 0, f'No poses found for trajectory {ind}'
@@ -786,16 +793,48 @@ class RobinGas(RobinGasBase):
 
         return mask
 
+    def get_track_vels(self, i, T_horizon, dt=None):
+        if not os.path.exists(self.controls_path):
+            print(f'Controls file {self.controls_path} does not exist')
+            return None
+        data = np.loadtxt(self.controls_path, delimiter=',', skiprows=1)
+        all_stamps, all_vels = data[:, 0], data[:, 1:]
+        time_left = self.ts[i]
+        time_right = time_left + T_horizon
+        # find the closest index to the left and right in all times
+        il = np.argmin(np.abs(np.asarray(all_stamps) - time_left))
+        ir = np.argmin(np.abs(np.asarray(all_stamps) - time_right))
+        ir = np.clip(ir, 0, len(all_vels) - 1)
+        timestamps = np.asarray(all_stamps[il:ir])
+        timestamps = timestamps - timestamps[0]
+        vels = all_vels[il:ir]
+
+        if dt is not None:
+            # velocities interpolation
+            interp_times = np.arange(timestamps[0], timestamps[-1], dt)
+            interp_vels = np.zeros((len(interp_times), 2))
+            for i in range(vels.shape[1]):
+                interp_vels[:, i] = np.interp(interp_times, timestamps, vels[:, i])
+
+            timestamps = interp_times
+            vels = interp_vels
+
+        return timestamps, vels
+
     def get_sample(self, i):
         img, rot, tran, intrins, post_rots, post_trans = self.get_images_data(i)
         hm_geom = self.get_geom_height_map(i)
         hm_terrain = self.get_terrain_height_map(i)
-        stamps, poses = self.get_traj(i, n_frames=10, xyz_quat=True)
+        pose_stamps, poses = self.get_traj(i, T_horizon=10.0, xyz_quat=True)
+        control_stamps, controls = self.get_track_vels(i, T_horizon=10.0, dt=1e-3)
         if self.only_front_cam:
             mask = self.front_height_map_mask()
             hm_geom[1] = hm_geom[1] * torch.from_numpy(mask)
             hm_terrain[1] = hm_terrain[1] * torch.from_numpy(mask)
-        return img, rot, tran, intrins, post_rots, post_trans, hm_geom, hm_terrain, stamps, poses
+        return (img, rot, tran, intrins, post_rots, post_trans,
+                hm_geom, hm_terrain,
+                pose_stamps, poses,
+                control_stamps, controls)
 
 
 def compile_data(robot='tradr', seq_i=None, small=False):
