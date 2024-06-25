@@ -283,8 +283,8 @@ def main():
     batch_size = 1
     lr = 1e-6
     robot = 'tradr'
-    # lss_weights_path = f'config/weights/lss_robingas_{robot}.pt'
-    lss_weights_path = None
+    lss_weights_path = f'config/weights/lss_robingas_{robot}.pt'
+    # lss_weights_path = None
     lss_cfg_path = f'config/lss_cfg_{robot}.yaml'
     dphys_cfg_path = 'config/dphys_cfg.yaml'
 

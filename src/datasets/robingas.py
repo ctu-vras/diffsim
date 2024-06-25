@@ -826,18 +826,26 @@ class RobinGas(RobinGasBase):
         imgs, rots, trans, intrins, post_rots, post_trans = self.get_images_data(i)
         hm_geom = self.get_geom_height_map(i)
         hm_terrain = self.get_terrain_height_map(i)
-        # make sure poses time horizon is not smaller as control time horizon (11.0 > 10.0)
-        # because we need to interpolate poses to control timestamps
-        pose_stamps, poses = self.get_traj(i, T_horizon=11.0, xyz_quat=True)
-        control_stamps, controls = self.get_track_vels(i, T_horizon=10.0, dt=1e-3)
-        # interpolate poses to control timestamps
-        poses = interpolate_poses(poses_times=pose_stamps, poses=poses, interp_times=control_stamps)
-        timestamps = control_stamps
-
         if self.only_front_cam:
             mask = self.front_height_map_mask()
             hm_geom[1] = hm_geom[1] * torch.from_numpy(mask)
             hm_terrain[1] = hm_terrain[1] * torch.from_numpy(mask)
+
+        # make sure poses time horizon is not smaller as control time horizon (12.0 > 11.0)
+        # because we need to interpolate poses to control timestamps
+        T_horizon, dt = 10.0, 1e-3
+        pose_stamps, poses = self.get_traj(i, T_horizon=T_horizon + 2.0, xyz_quat=True)
+        control_stamps, controls = self.get_track_vels(i, T_horizon=T_horizon + 1.0, dt=dt)
+        # interpolate poses to control timestamps
+        poses = interpolate_poses(poses_times=pose_stamps, poses=poses, interp_times=control_stamps)
+        timestamps = control_stamps
+
+        # fixed length of the trajectory
+        n_frames = min(len(poses), int(T_horizon / dt))
+        poses = poses[:n_frames]
+        timestamps = timestamps[:n_frames]
+        controls = controls[:n_frames]
+
         return (imgs, rots, trans, intrins, post_rots, post_trans,
                 hm_geom, hm_terrain,
                 timestamps, poses, controls)
