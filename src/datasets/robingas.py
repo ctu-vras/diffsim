@@ -11,6 +11,7 @@ from ..utils import img_transform, normalize_img, ego_to_cam, get_only_in_img_ma
 from ..utils import position, normalize, load_calib, read_yaml
 from ..config import DPhysConfig
 from .coco import COCO_CATEGORIES
+from ..transforms import interpolate_poses
 import cv2
 import albumentations as A
 from PIL import Image
@@ -822,19 +823,24 @@ class RobinGas(RobinGasBase):
         return timestamps, vels
 
     def get_sample(self, i):
-        img, rot, tran, intrins, post_rots, post_trans = self.get_images_data(i)
+        imgs, rots, trans, intrins, post_rots, post_trans = self.get_images_data(i)
         hm_geom = self.get_geom_height_map(i)
         hm_terrain = self.get_terrain_height_map(i)
-        pose_stamps, poses = self.get_traj(i, T_horizon=10.0, xyz_quat=True)
+        # make sure poses time horizon is not smaller as control time horizon (11.0 > 10.0)
+        # because we need to interpolate poses to control timestamps
+        pose_stamps, poses = self.get_traj(i, T_horizon=11.0, xyz_quat=True)
         control_stamps, controls = self.get_track_vels(i, T_horizon=10.0, dt=1e-3)
+        # interpolate poses to control timestamps
+        poses = interpolate_poses(poses_times=pose_stamps, poses=poses, interp_times=control_stamps)
+        timestamps = control_stamps
+
         if self.only_front_cam:
             mask = self.front_height_map_mask()
             hm_geom[1] = hm_geom[1] * torch.from_numpy(mask)
             hm_terrain[1] = hm_terrain[1] * torch.from_numpy(mask)
-        return (img, rot, tran, intrins, post_rots, post_trans,
+        return (imgs, rots, trans, intrins, post_rots, post_trans,
                 hm_geom, hm_terrain,
-                pose_stamps, poses,
-                control_stamps, controls)
+                timestamps, poses, controls)
 
 
 def compile_data(robot='tradr', seq_i=None, small=False):

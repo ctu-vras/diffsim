@@ -105,8 +105,7 @@ class Learner:
         batch = [torch.as_tensor(b, dtype=torch.float32, device=self.device) for b in batch]
         (imgs, rots, trans, intrins, post_rots, post_trans,
          hm_geom, hm_terrain,
-         pose_stamps, poses,
-         control_stamps, controls) = batch
+         timestamps, poses, controls) = batch
         imgs_data = [imgs, rots, trans, intrins, post_rots, post_trans]
 
         # predict heightmaps
@@ -154,8 +153,7 @@ class Learner:
         with torch.no_grad():
             (imgs, rots, trans, intrins, post_rots, post_trans,
              hm_geom, hm_terrain,
-             pose_stamps, poses,
-             control_stamps, controls) = batch
+             timestamps, poses, controls) = batch
             inputs = [imgs, rots, trans, intrins, post_rots, post_trans]
             inputs = [torch.as_tensor(i, dtype=torch.float32, device=self.device) for i in inputs]
             voxel_feats = self.terrain_encoder.get_voxels(*inputs)
@@ -211,23 +209,21 @@ class Learner:
     def test_control(self):
         for _ in range(5):
             with torch.no_grad():
-                # get ground-truth trajectory
                 batch = next(iter(self.data_loader))
                 (imgs, rots, trans, intrins, post_rots, post_trans,
                  hm_geom, hm_terrain,
-                 pose_stamps, poses,
-                 control_stamps, controls) = batch
+                 timestamps, poses, controls) = batch
 
                 controls = controls.transpose(1, 0)  # [B, T, C] -> [T, B, C]
                 flipper_angles = torch.zeros((controls.shape[0], self.batch_size, 4))
                 poses[:, :, 2] += 1.0  # add height offset
 
-                T_horizon_ms = max(pose_stamps[:, -1].max(), control_stamps[:, -1].max()) * 1000
+                T_horizon_ms = timestamps[:, -1].max() * 1000
                 T_horizon_ms = int(np.round(T_horizon_ms))
                 T_segment_ms = 300
 
                 self.dphys.set_T(T_horizon_ms, T_segment_ms)
-                self.dphys.set_target_poses(pose_stamps * 1000, poses)
+                self.dphys.set_target_poses(timestamps * 1000, poses)
                 self.dphys.set_controls(controls, flipper_angles)
 
                 self.dphys.render_heightmaps()
@@ -243,19 +239,18 @@ class Learner:
         batch = next(iter(self.data_loader))
         (imgs, rots, trans, intrins, post_rots, post_trans,
          hm_geom, hm_terrain,
-         pose_stamps, poses,
-         control_stamps, controls) = batch
+         timestamps, poses, controls) = batch
 
         controls = controls.transpose(1, 0)  # [B, T, C] -> [T, B, C]
         flipper_angles = torch.zeros((controls.shape[0], self.batch_size, 4))
         poses[:, :, 2] += 1.0  # add height offset
 
-        T_horizon_ms = max(pose_stamps[:, -1].max(), control_stamps[:, -1].max()) * 1000
+        T_horizon_ms = timestamps[:, -1].max() * 1000
         T_horizon_ms = int(np.round(T_horizon_ms))
         T_segment_ms = 300
 
         self.dphys.set_T(T_horizon_ms, T_segment_ms)
-        self.dphys.set_target_poses(pose_stamps * 1000, poses)
+        self.dphys.set_target_poses(timestamps * 1000, poses)
         self.dphys.set_controls(controls, flipper_angles)
 
         if self.use_renderer:

@@ -271,10 +271,6 @@ class DiffSim:
         self.num_shoots = int(np.ceil(T / T_s))
         self.T = self.num_shoots * T_s
 
-        print('T: ', self.T)
-        print('T_s: ', self.T_s)
-        print('num_shoots: ', self.num_shoots)
-
         # init simulation state buffers
         self.body_q = wp.zeros((self.T, self.sim_robots), dtype=wp.transformf, device=self.device, requires_grad=True)
         self.body_qd = wp.zeros((self.T, self.sim_robots), dtype=wp.spatial_vectorf, device=self.device, requires_grad=True)
