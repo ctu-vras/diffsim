@@ -831,13 +831,11 @@ class RobinGas(RobinGasBase):
             hm_geom[1] = hm_geom[1] * torch.from_numpy(mask)
             hm_terrain[1] = hm_terrain[1] * torch.from_numpy(mask)
 
-        # make sure poses time horizon is not smaller as control time horizon (12.0 > 11.0)
-        # because we need to interpolate poses to control timestamps
-        T_horizon, dt = 10.0, 1e-3
-        pose_stamps, poses = self.get_traj(i, T_horizon=T_horizon + 2.0, xyz_quat=True)
-        control_stamps, controls = self.get_track_vels(i, T_horizon=T_horizon + 1.0, dt=dt)
+        T_horizon, dt = 6.0, 1e-3
+        pose_stamps, poses = self.get_traj(i, T_horizon=T_horizon, xyz_quat=True)
+        control_stamps, controls = self.get_track_vels(i, T_horizon=T_horizon, dt=dt)
         # interpolate poses to control timestamps
-        poses = interpolate_poses(poses_times=pose_stamps, poses=poses, interp_times=control_stamps)
+        poses = interpolate_poses(poses_times=pose_stamps, poses=poses, target_times=control_stamps)
         timestamps = control_stamps
 
         # fixed length of the trajectory

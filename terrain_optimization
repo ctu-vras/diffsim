@@ -99,9 +99,7 @@ class Learner:
         loss_traj = wp.to_torch(loss_traj) / self.batch_size
         return loss_traj
 
-    def step(self, batch, max_grad_norm=5.0):
-        self.dphys.init_shoot_states()  # load initial states for the shooter
-
+    def step(self, batch):
         batch = [torch.as_tensor(b, dtype=torch.float32, device=self.device) for b in batch]
         (imgs, rots, trans, intrins, post_rots, post_trans,
          hm_geom, hm_terrain,
@@ -110,28 +108,30 @@ class Learner:
 
         # predict heightmaps
         height_pred = self.terrain_encoder(*imgs_data).squeeze(1)
+
         # dphysics trajectory loss
         loss_traj = self.traj_loss(height_pred)
-        self.tb_writer.add_scalar('loss/traj', loss_traj, self.counter)
-        print(f'Loss traj: {loss_traj.item()}', flush=True)
+        loss_traj /= timestamps.shape[1]
 
         # geometry heightmap loss
         loss_geom = self.geom_hm_loss(height_gt=hm_geom[:, 0], height_pred=height_pred, weights=hm_geom[:, 1])
-        self.tb_writer.add_scalar('loss/geom', loss_geom, self.counter)
-        # print(f'Loss geom: {loss_geom.item()}', flush=True)
 
+        # total loss
         loss = loss_geom + loss_traj
+
+        self.tb_writer.add_scalar('loss/traj', loss_traj, self.counter)
+        self.tb_writer.add_scalar('loss/geom', loss_geom, self.counter)
         self.tb_writer.add_scalar('loss/total', loss, self.counter)
 
         height_pred.backward(height_pred.grad, retain_graph=True)
         loss_geom.backward(retain_graph=True)
 
-        torch.nn.utils.clip_grad_norm_(self.terrain_encoder.parameters(), max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(self.terrain_encoder.parameters(), max_norm=5.0)
         self.optimizer.step()
         # necessary, since tape.zero() does not reach the torch tensor for some reason
         self.optimizer.zero_grad(set_to_none=False)
 
-        return loss, height_pred
+        return loss
 
     def vis_pred(self, batch):
         fig = plt.figure(figsize=(20, 12))
@@ -259,7 +259,9 @@ class Learner:
 
         # TODO: train with multiple batches
         for _ in tqdm(range(n_iters)):
-            loss, height_pred = self.step(batch)
+            self.dphys.init_shoot_states()  # load initial states for the shooter
+
+            loss = self.step(batch)
 
             if self.counter % n_vis_steps == 0:
                 print(f'Loss: {loss.item()}')
