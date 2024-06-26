@@ -492,6 +492,7 @@ class RobinGas(RobinGasBase):
                  path,
                  lss_cfg,
                  dphys_cfg=DPhysConfig(),
+                 T_horizon=10.0,
                  is_train=False,
                  only_front_cam=False):
         super(RobinGas, self).__init__(path, dphys_cfg)
@@ -502,6 +503,8 @@ class RobinGas(RobinGasBase):
         self.lss_cfg = lss_cfg
         # initialize image augmentations
         self.img_augs = self.get_img_augs()
+
+        self.T_horizon = T_horizon
 
     def get_img_augs(self):
         if self.is_train:
@@ -831,15 +834,15 @@ class RobinGas(RobinGasBase):
             hm_geom[1] = hm_geom[1] * torch.from_numpy(mask)
             hm_terrain[1] = hm_terrain[1] * torch.from_numpy(mask)
 
-        T_horizon, dt = 6.0, 1e-3
+        T_horizon, dt = self.T_horizon, 1e-3
         pose_stamps, poses = self.get_traj(i, T_horizon=T_horizon, xyz_quat=True)
         control_stamps, controls = self.get_track_vels(i, T_horizon=T_horizon, dt=dt)
+
         # interpolate poses to control timestamps
         poses = interpolate_poses(poses_times=pose_stamps, poses=poses, target_times=control_stamps)
         timestamps = control_stamps
-
         # fixed length of the trajectory
-        n_frames = min(len(poses), int(T_horizon / dt))
+        n_frames = min(len(poses), int(0.9*T_horizon / dt))
         poses = poses[:n_frames]
         timestamps = timestamps[:n_frames]
         controls = controls[:n_frames]
@@ -849,7 +852,7 @@ class RobinGas(RobinGasBase):
                 timestamps, poses, controls)
 
 
-def compile_data(robot='tradr', seq_i=None, small=False):
+def compile_data(seq_i=None, robot='tradr', T_horizon=10., small=False, is_train=False):
     dphys_cfg = DPhysConfig()
     dphys_cfg_path = os.path.join(data_dir, '../config/dphys_cfg.yaml')
     assert os.path.isfile(dphys_cfg_path), 'Config file %s does not exist' % dphys_cfg_path
@@ -864,7 +867,7 @@ def compile_data(robot='tradr', seq_i=None, small=False):
     else:
         path = np.random.choice(robingas_seq_paths[robot])
 
-    ds = RobinGas(path=path, dphys_cfg=dphys_cfg, lss_cfg=lss_cfg)
+    ds = RobinGas(path=path, dphys_cfg=dphys_cfg, lss_cfg=lss_cfg, T_horizon=T_horizon, is_train=is_train)
     if small:
         ds = ds[np.random.choice(len(ds), 32, replace=False)]
 

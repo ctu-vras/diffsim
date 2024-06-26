@@ -1,5 +1,5 @@
 import os
-
+from timeit import default_timer as timer
 import numpy as np
 import torch
 import torchvision
@@ -238,3 +238,13 @@ def read_yaml(path):
     with open(path, 'r') as f:
         data = yaml.load(f, Loader=yaml.Loader)
     return data
+
+
+def timing(f):
+    def timing_wrapper(*args, **kwargs):
+        t0 = timer()
+        ret = f(*args, **kwargs)
+        t1 = timer()
+        print('%s %.6f s' % (f.__name__, t1 - t0))
+        return ret
+    return timing_wrapper

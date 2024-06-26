@@ -19,16 +19,22 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 wp.init()  # init warp!
 
 
+torch.random.manual_seed(0)
+np.random.seed(0)
+
+
 class Learner:
     def __init__(self, batch_size=1, lr=1e-6, weight_decay=1e-7,
                  ls_cfg_path='config/lss_cfg.yaml',
                  lss_weights_path=None,
                  dphys_cfg_path='config/dphys_cfg.yaml',
+                 T_horizon=10.0,
                  device='cpu', use_renderer=False):
         self.device = device
         self.use_cuda_graph = True if device == 'cuda' else False
         self.use_renderer = use_renderer
         self.batch_size = batch_size
+        self.T_horizon = T_horizon
 
         self.lss_cfg = read_yaml(ls_cfg_path)
         self.lss_weights = lss_weights_path
@@ -48,7 +54,7 @@ class Learner:
         self.counter = 0
 
     def init_dataloader(self, **kwargs):
-        ds = compile_data(robot='tradr')
+        ds = compile_data(robot='tradr', T_horizon=self.T_horizon)
         print('Dataset size:', len(ds))
         data_loader = DataLoader(ds, **kwargs)
         return data_loader
@@ -206,37 +212,7 @@ class Learner:
 
             return fig
 
-    def test_control(self):
-        for _ in range(5):
-            with torch.no_grad():
-                batch = next(iter(self.data_loader))
-                (imgs, rots, trans, intrins, post_rots, post_trans,
-                 hm_geom, hm_terrain,
-                 timestamps, poses, controls) = batch
-
-                controls = controls.transpose(1, 0)  # [B, T, C] -> [T, B, C]
-                flipper_angles = torch.zeros((controls.shape[0], self.batch_size, 4))
-                poses[:, :, 2] += 1.0  # add height offset
-
-                T_horizon_ms = timestamps[:, -1].max() * 1000
-                T_horizon_ms = int(np.round(T_horizon_ms))
-                T_segment_ms = 300
-
-                self.dphys.set_T(T_horizon_ms, T_segment_ms)
-                self.dphys.set_target_poses(timestamps * 1000, poses)
-                self.dphys.set_controls(controls, flipper_angles)
-
-                self.dphys.render_heightmaps()
-                self.dphys.render_traj(poses[0, :, :3].cpu().numpy())
-
-                self.dphys.init_shoot_states()  # load initial states for the shooter
-                self.dphys.save_shoot_init_vels()  # save states for shooter
-                self.dphys.simulate_single()  # simulate a single long trajectory for testing
-                self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
-                self.dphys.render_simulation(pause=False)
-
-    def learn(self, n_iters=1000, n_vis_steps=10):
-        batch = next(iter(self.data_loader))
+    def set_poses_and_controls(self, batch):
         (imgs, rots, trans, intrins, post_rots, post_trans,
          hm_geom, hm_terrain,
          timestamps, poses, controls) = batch
@@ -257,7 +233,22 @@ class Learner:
             self.dphys.render_heightmaps()
             self.dphys.render_traj(poses[0, :, :3].cpu().numpy())
 
-        # TODO: train with multiple batches
+    def test_control(self):
+        for _ in range(5):
+            with torch.no_grad():
+                batch = next(iter(self.data_loader))
+                self.set_poses_and_controls(batch)
+
+                self.dphys.init_shoot_states()  # load initial states for the shooter
+                self.dphys.save_shoot_init_vels()  # save states for shooter
+                self.dphys.simulate_single()  # simulate a single long trajectory for testing
+                self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
+                self.dphys.render_simulation(pause=False)
+
+    def learn_sample(self, n_iters=1000, n_vis_steps=10):
+        batch = next(iter(self.data_loader))
+        self.set_poses_and_controls(batch)
+
         for _ in tqdm(range(n_iters)):
             self.dphys.init_shoot_states()  # load initial states for the shooter
 
@@ -265,6 +256,28 @@ class Learner:
 
             if self.counter % n_vis_steps == 0:
                 print(f'Loss: {loss.item()}')
+                fig = self.vis_pred(batch)
+                self.tb_writer.add_figure('train/prediction', fig, self.counter)
+                self.tb_writer.flush()
+
+                if self.use_renderer:
+                    self.dphys.save_shoot_init_vels()  # save states for shooter
+                    self.dphys.simulate_single()  # simulate a single long trajectory for testing
+                    self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
+                    self.dphys.render_simulation(pause=False)
+
+            # update counter
+            self.counter += 1
+
+    def epoch(self, n_vis_steps=10):
+        for batch in tqdm(self.data_loader):
+            self.set_poses_and_controls(batch)
+
+            self.dphys.init_shoot_states()  # load initial states for the shooter
+
+            loss = self.step(batch)
+
+            if self.counter % n_vis_steps == 0:
                 fig = self.vis_pred(batch)
                 self.tb_writer.add_figure('train/prediction', fig, self.counter)
                 self.tb_writer.flush()
@@ -289,15 +302,18 @@ def main():
     # lss_weights_path = None
     lss_cfg_path = f'config/lss_cfg_{robot}.yaml'
     dphys_cfg_path = 'config/dphys_cfg.yaml'
+    T_horizon = 4.0
 
     learner = Learner(batch_size=batch_size,
                       lr=lr,
                       ls_cfg_path=lss_cfg_path,
                       lss_weights_path=lss_weights_path,
                       dphys_cfg_path=dphys_cfg_path,
+                      T_horizon=T_horizon,
                       device=device,
                       use_renderer=use_renderer)
-    learner.learn()
+    # learner.epoch()
+    learner.learn_sample()
     # learner.test_control()
 
 
