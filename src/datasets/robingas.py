@@ -7,7 +7,7 @@ from scipy.interpolate import griddata
 from scipy.spatial.transform import Rotation
 from skimage.draw import polygon
 from torch.utils.data import Dataset
-from ..utils import img_transform, normalize_img, ego_to_cam, get_only_in_img_mask, sample_augmentation
+from ..utils import img_transform, normalize_img, ego_to_cam, get_only_in_img_mask, sample_augmentation, timing
 from ..utils import position, normalize, load_calib, read_yaml
 from ..config import DPhysConfig
 from .coco import COCO_CATEGORIES
@@ -22,6 +22,7 @@ __all__ = [
     'data_dir',
     'RobinGas',
     'robingas_seq_paths',
+    'compile_data',
 ]
 
 
@@ -43,7 +44,6 @@ robingas_seq_paths = {
         os.path.join(data_dir, 'RobinGas/tradr/ugv_2022-10-20-14-30-57'),
         os.path.join(data_dir, 'RobinGas/tradr/ugv_2022-10-20-14-05-42'),
         os.path.join(data_dir, 'RobinGas/tradr/ugv_2022-10-20-13-58-22'),
-        # os.path.join(data_dir, 'RobinGas/tradr/ugv_2022-06-30-11-30-57'),
     ],
     'husky_oru': [
         os.path.join(data_dir, 'RobinGas/husky_oru/radarize__2023-08-16-11-02-33_0'),
@@ -54,7 +54,6 @@ robingas_seq_paths = {
         os.path.join(data_dir, 'RobinGas/husky_oru/radarize__2023-08-16-11-54-42_0'),
         os.path.join(data_dir, 'RobinGas/husky_oru/radarize__2024-02-07-10-47-13_0'),  # no radar
         os.path.join(data_dir, 'RobinGas/husky_oru/radarize__2024-04-27-15-02-12_0'),
-        # os.path.join(data_dir, 'RobinGas/husky_oru/radarize__2024-05-01-15-48-29_0'),  # localization must be fixed
         os.path.join(data_dir, 'RobinGas/husky_oru/radarize__2024-05-24-13-21-28_0'),  # no radar
     ],
 }
@@ -334,13 +333,17 @@ class RobinGasBase(Dataset):
                 stamps = np.asarray(copy.copy(self.ts), dtype=np.float32)
             else:
                 il = all_ids.index(ind)
-                time_left = self.ts[il]
-                time_right = time_left + T_horizon
-                # find the closest index to the right in all times
-                ir = np.argmin(np.abs(np.asarray(all_times) - time_right))
-                ir = np.clip(ir, 0, len(all_poses) - 1)
-                poses = all_poses[il:ir]
-                stamps = np.asarray(copy.copy(self.ts[il:ir]))
+                if il == len(all_ids) - 1:
+                    poses = all_poses[il:]
+                    stamps = np.asarray(copy.copy(self.ts[il:]))
+                else:
+                    time_left = copy.copy(self.ts[il])
+                    time_right = time_left + T_horizon
+                    # find the closest index to the right in all times
+                    ir = np.argmin(np.abs(np.asarray(all_times) - time_right))
+                    ir = np.clip(ir, 0, len(all_poses) - 1)
+                    poses = all_poses[il:ir]
+                    stamps = np.asarray(copy.copy(self.ts[il:ir]))
             assert len(poses) > 0, f'No poses found for trajectory {ind}'
 
         # initialize at the origin
@@ -472,6 +475,26 @@ class RobinGasBase(Dataset):
         return len(self.ids)
 
 
+def interpolate_poses_to_control(poses, pose_stamps, controls, control_stamps, T_horizon, dt):
+    # interpolate poses to control timestamps
+    poses = interpolate_poses(poses_times=pose_stamps, poses=poses, target_times=control_stamps)
+    timestamps = control_stamps
+    # fixed length of the trajectory
+    n_frames = int(0.9*T_horizon / dt)
+    if n_frames <= len(poses):
+        poses = poses[:n_frames]
+        timestamps = timestamps[:n_frames]
+        controls = controls[:n_frames]
+    else:
+        # pad trajectory with last state
+        n_pad = n_frames - len(poses)
+        poses = np.concatenate([poses, poses[-1].reshape((1, 7)) * np.ones((n_pad, 7))], axis=0)  # repeat last pose
+        timestamps = np.concatenate([timestamps, np.linspace(timestamps[-1] + dt, timestamps[-1] + n_pad * dt, n_pad)])
+        controls = np.concatenate([controls, np.zeros((n_pad, 2))], axis=0)  # zero control
+    assert len(poses) == len(timestamps) == len(controls)
+    return poses, timestamps, controls
+
+
 class RobinGas(RobinGasBase):
     """
     A dataset for traversability estimation from camera and lidar data.
@@ -564,8 +587,6 @@ class RobinGas(RobinGasBase):
 
         for cam in self.cameras:
             img, K = self.get_image(i, cam)
-            # if self.is_train:
-            #     img = self.img_augs(image=np.asarray(img))['image']
 
             post_rot = torch.eye(2)
             post_tran = torch.zeros(2)
@@ -803,7 +824,7 @@ class RobinGas(RobinGasBase):
             return None
         data = np.loadtxt(self.controls_path, delimiter=',', skiprows=1)
         all_stamps, all_vels = data[:, 0], data[:, 1:]
-        time_left = self.ts[i]
+        time_left = copy.copy(self.ts[i])
         time_right = time_left + T_horizon
         # find the closest index to the left and right in all times
         il = np.argmin(np.abs(np.asarray(all_stamps) - time_left))
@@ -828,27 +849,17 @@ class RobinGas(RobinGasBase):
     def get_sample(self, i):
         imgs, rots, trans, intrins, post_rots, post_trans = self.get_images_data(i)
         hm_geom = self.get_geom_height_map(i)
-        hm_terrain = self.get_terrain_height_map(i)
-        if self.only_front_cam:
-            mask = self.front_height_map_mask()
-            hm_geom[1] = hm_geom[1] * torch.from_numpy(mask)
-            hm_terrain[1] = hm_terrain[1] * torch.from_numpy(mask)
 
         T_horizon, dt = self.T_horizon, 1e-3
         pose_stamps, poses = self.get_traj(i, T_horizon=T_horizon, xyz_quat=True)
         control_stamps, controls = self.get_track_vels(i, T_horizon=T_horizon, dt=dt)
 
         # interpolate poses to control timestamps
-        poses = interpolate_poses(poses_times=pose_stamps, poses=poses, target_times=control_stamps)
-        timestamps = control_stamps
-        # fixed length of the trajectory
-        n_frames = min(len(poses), int(0.9*T_horizon / dt))
-        poses = poses[:n_frames]
-        timestamps = timestamps[:n_frames]
-        controls = controls[:n_frames]
+        poses, timestamps, controls = interpolate_poses_to_control(poses, pose_stamps, controls, control_stamps,
+                                                                   T_horizon, dt)
 
         return (imgs, rots, trans, intrins, post_rots, post_trans,
-                hm_geom, hm_terrain,
+                hm_geom,
                 timestamps, poses, controls)
 
 

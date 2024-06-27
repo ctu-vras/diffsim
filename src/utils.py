@@ -8,6 +8,15 @@ import yaml
 from numpy.lib.recfunctions import structured_to_unstructured
 
 
+def timing(f):
+    def timing_wrapper(*args, **kwargs):
+        t0 = timer()
+        ret = f(*args, **kwargs)
+        t1 = timer()
+        print('%s %.6f s' % (f.__name__, t1 - t0))
+        return ret
+    return timing_wrapper
+
 def load_config(fname):
     with open(fname, "r") as f:
         config = yaml.safe_load(f)
@@ -107,7 +116,6 @@ normalize_img = torchvision.transforms.Compose((
                 torchvision.transforms.ToTensor(),
                 torchvision.transforms.Normalize(mean=mean, std=std),
 ))
-
 
 def sample_augmentation(lss_cfg, is_train=False):
     H, W = lss_cfg['data_aug_conf']['H'], lss_cfg['data_aug_conf']['W']
@@ -238,13 +246,3 @@ def read_yaml(path):
     with open(path, 'r') as f:
         data = yaml.load(f, Loader=yaml.Loader)
     return data
-
-
-def timing(f):
-    def timing_wrapper(*args, **kwargs):
-        t0 = timer()
-        ret = f(*args, **kwargs)
-        t1 = timer()
-        print('%s %.6f s' % (f.__name__, t1 - t0))
-        return ret
-    return timing_wrapper

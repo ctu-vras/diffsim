@@ -53,7 +53,9 @@ def warp_hm_to_torch(heights: wp.array2d(dtype=wp.float32), torch_hms: wp.array3
 
 @wp.kernel
 def copy_state(body_q: wp.array2d(dtype=wp.transformf), state_body_q: wp.array(dtype=wp.transformf), sim_idx: int):
-    """copy the simulation state body_q into rendering state state_body_q at index sim_idx"""
+    """
+    Copy the simulation state body_q into rendering state state_body_q at index sim_idx
+    """
     tid = wp.tid()
     state_body_q[tid] = body_q[sim_idx][tid]
 
@@ -292,7 +294,10 @@ class DiffSim:
         self.contact_info = [constraint_forces, friction_forces, contact_positions]
 
     def set_target_poses(self, timesteps, poses):
-        '''based on a list of stamped poses for each robot, set the simulation ready ground truth trajectories and initial states'''
+        """
+        Based on a list of stamped poses for each robot, set the simulation ready ground truth trajectories and
+        initial states
+        """
         assert len(timesteps) == self.sim_robots
         assert len(poses) == self.sim_robots
 
