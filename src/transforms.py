@@ -9,7 +9,7 @@ def interpolate_poses(poses_times, poses, target_times):
     https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.transform.Slerp.html
     """
     assert len(poses_times) == len(poses)
-    assert len(poses_times) > 1
+    assert len(poses_times) > 0
     assert poses.shape[1] == 7  # [x, y, z, qx, qy, qz, qw]
 
     # repeat poses for time moments that are outside the range of poses_times

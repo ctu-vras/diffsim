@@ -341,6 +341,7 @@ class RobinGasBase(Dataset):
                     time_right = time_left + T_horizon
                     # find the closest index to the right in all times
                     ir = np.argmin(np.abs(np.asarray(all_times) - time_right))
+                    ir = max(il + 1, ir)
                     ir = np.clip(ir, 0, len(all_poses) - 1)
                     poses = all_poses[il:ir]
                     stamps = np.asarray(copy.copy(self.ts[il:ir]))
@@ -829,6 +830,7 @@ class RobinGas(RobinGasBase):
         # find the closest index to the left and right in all times
         il = np.argmin(np.abs(np.asarray(all_stamps) - time_left))
         ir = np.argmin(np.abs(np.asarray(all_stamps) - time_right))
+        ir = max(il + 1, ir)
         ir = np.clip(ir, 0, len(all_vels) - 1)
         timestamps = np.asarray(all_stamps[il:ir])
         timestamps = timestamps - timestamps[0]

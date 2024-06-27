@@ -224,10 +224,7 @@ class Learner:
         flipper_angles = torch.zeros((controls.shape[0], self.batch_size, 4))
         poses[:, :, 2] += 1.0  # add height offset
 
-        T_horizon_ms = int(1000 * self.T_horizon)
-        T_segment_ms = 300
-
-        self.dphys.set_T(T_horizon_ms, T_segment_ms)
+        self.dphys.set_T(T=int(1000 * self.T_horizon), T_s=300)
         self.dphys.set_target_poses(timestamps * 1000, poses)
         self.dphys.set_controls(controls, flipper_angles)
 
@@ -239,8 +236,14 @@ class Learner:
         for _ in range(n_trials):
             with torch.no_grad():
                 batch = next(iter(self.data_loader))
-                self.set_poses_and_controls(batch)
 
+                # show front image
+                img = denormalize_img(batch[0][0, 0, :3])
+                plt.imshow(img)
+                plt.show()
+
+                # show control sequence
+                self.set_poses_and_controls(batch)
                 self.dphys.init_shoot_states()  # load initial states for the shooter
                 self.dphys.save_shoot_init_vels()  # save states for shooter
                 self.dphys.simulate_single()  # simulate a single long trajectory for testing
@@ -296,7 +299,7 @@ class Learner:
 
 def main():
     device = "cuda"
-    use_renderer = False
+    use_renderer = True
     batch_size = 1
     lr = 1e-6
     robot = 'tradr'
@@ -304,7 +307,7 @@ def main():
     # lss_weights_path = None
     lss_cfg_path = f'config/lss_cfg_{robot}.yaml'
     dphys_cfg_path = 'config/dphys_cfg.yaml'
-    T_horizon = 4.0
+    T_horizon = 10.0
 
     learner = Learner(batch_size=batch_size,
                       lr=lr,
@@ -315,8 +318,8 @@ def main():
                       device=device,
                       use_renderer=use_renderer)
     # learner.epoch()
-    learner.learn_sample()
-    # learner.test_control()
+    # learner.learn_sample()
+    learner.test_control()
 
 
 if __name__ == '__main__':
