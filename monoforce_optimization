@@ -29,6 +29,7 @@ class Learner:
                  lss_weights_path=None,
                  dphys_cfg_path='config/dphys_cfg.yaml',
                  T_horizon=10.0,
+                 dt=0.0005,
                  device='cpu',
                  use_renderer=False,
                  use_cuda_graph=False):
@@ -37,6 +38,7 @@ class Learner:
         self.use_renderer = use_renderer
         self.batch_size = batch_size
         self.T_horizon = T_horizon
+        self.dt = dt
 
         self.lss_cfg = read_yaml(ls_cfg_path)
         self.lss_weights = lss_weights_path
@@ -56,7 +58,7 @@ class Learner:
         self.counter = 0
 
     def init_dataloader(self, **kwargs):
-        ds = compile_data(seq_i=2, robot='tradr', T_horizon=self.T_horizon)
+        ds = compile_data(robot='tradr', T_horizon=self.T_horizon, dt=self.dt, small=False)
         print('Dataset size:', len(ds))
         data_loader = DataLoader(ds, **kwargs)
         return data_loader
@@ -72,7 +74,7 @@ class Learner:
 
     def init_diff_physics(self):
         torch_hms, res = self.get_initial_heightmaps(self.batch_size)
-        dphys = DiffSim(torch_hms, res, use_renderer=self.use_renderer, device=self.device)
+        dphys = DiffSim(torch_hms, res, dt=self.dt, use_renderer=self.use_renderer, device=self.device)
         return dphys
 
     def get_initial_heightmaps(self, batch_size):
@@ -128,11 +130,11 @@ class Learner:
 
         print(f'Loss traj: {loss_traj.item()}')
         print(f'Loss geom: {loss_geom.item()}')
-        print('HM grad mean:', height_pred.grad.abs().mean().item())
-
+        # print('HM grad mean:', height_pred.grad.abs().mean().item())
         self.tb_writer.add_scalar('loss/traj', loss_traj, self.counter)
         self.tb_writer.add_scalar('loss/geom', loss_geom, self.counter)
         self.tb_writer.add_scalar('loss/total', loss_traj + loss_geom, self.counter)
+        self.tb_writer.flush()
 
         if backprop:
             height_pred.backward(height_pred.grad, retain_graph=True)
@@ -220,7 +222,7 @@ class Learner:
         flipper_angles = torch.zeros((controls.shape[1], self.batch_size, 4))
         poses[:, :, 2] += 1.0  # add height offset
 
-        self.dphys.set_T(T=int(1000 * self.T_horizon), T_s=300)
+        self.dphys.set_T(T=int(self.T_horizon / self.dt), T_s=300)
         self.dphys.set_target_poses(timestamps * 1000, poses)
         self.dphys.set_controls(controls, flipper_angles)
 
@@ -246,62 +248,53 @@ class Learner:
                 self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
                 self.dphys.render_simulation(pause=False)
 
-    def learn_sample(self, n_iters=1000, n_vis_steps=10):
-        batch = next(iter(self.data_loader))
-        self.set_poses_and_controls(batch)
-        self.dphys.init_shoot_states()  # load initial states for the shooter
-
-        for _ in tqdm(range(n_iters)):
-            self.step(batch)
-
-            if self.counter % n_vis_steps == 0:
-                fig = self.vis_pred(batch)
-                self.tb_writer.add_figure('train/prediction', fig, self.counter)
-                self.tb_writer.flush()
-
-                if self.use_renderer:
-                    self.dphys.save_shoot_init_vels()  # save states for shooter
-                    self.dphys.simulate_single()  # simulate a single long trajectory for testing
-                    self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
-                    self.dphys.render_simulation(pause=False)
-
-            # update counter
-            self.counter += 1
-
-    def epoch(self, n_vis_steps=10):
-
+    def epoch(self):
+        loss = 0.0
         for batch in tqdm(self.data_loader):
             self.set_poses_and_controls(batch)
             self.dphys.init_shoot_states()  # load initial states for the shooter
 
             loss_traj, loss_geom = self.step(batch)
-
-            if self.counter % n_vis_steps == 0:
-                fig = self.vis_pred(batch)
-                self.tb_writer.add_figure('train/prediction', fig, self.counter)
-                self.tb_writer.flush()
-
-                if self.use_renderer:
-                    self.dphys.save_shoot_init_vels()  # save states for shooter
-                    self.dphys.simulate_single()  # simulate a single long trajectory for testing
-                    self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
-                    self.dphys.render_simulation(pause=False)
-
+            # update loss
+            loss += (loss_traj + loss_geom).item()
             # update counter
             self.counter += 1
+
+        fig = self.vis_pred(batch)
+        self.tb_writer.add_figure('train/prediction', fig, self.counter)
+        self.tb_writer.flush()
+
+        if self.use_renderer:
+            self.dphys.save_shoot_init_vels()  # save states for shooter
+            self.dphys.simulate_single()  # simulate a single long trajectory for testing
+            self.dphys.render_states('current', color=(1.0, 0.0, 0.0))
+            self.dphys.render_simulation(pause=False)
+
+        loss /= len(self.data_loader)
+        return loss
+
+    def train(self, n_epochs=1):
+        for epoch in range(n_epochs):
+            print(f'Epoch {epoch}')
+            loss = self.epoch()
+            print(f'Loss: {loss}')
+            self.tb_writer.add_scalar('loss/epoch', loss, epoch)
+            self.tb_writer.flush()
 
 
 def main():
     device = "cuda"
     use_renderer = False
     batch_size = 1
+    n_epochs = 10
     lr = 1e-6
     robot = 'tradr'
-    lss_weights_path = f'config/weights/lss_robingas_{robot}.pt'
-    # lss_weights_path = None
+    # lss_weights_path = f'config/weights/lss_robingas_{robot}.pt'
+    lss_weights_path = None
     lss_cfg_path = f'config/lss_cfg_{robot}.yaml'
     dphys_cfg_path = 'config/dphys_cfg.yaml'
     T_horizon = 10.0
+    dt = 0.0005
 
     learner = Learner(batch_size=batch_size,
                       lr=lr,
@@ -309,10 +302,10 @@ def main():
                       lss_weights_path=lss_weights_path,
                       dphys_cfg_path=dphys_cfg_path,
                       T_horizon=T_horizon,
+                      dt=dt,
                       device=device,
                       use_renderer=use_renderer)
-    learner.epoch()
-    # learner.learn_sample()
+    learner.train(n_epochs=n_epochs)
     # learner.test_control()
 
 

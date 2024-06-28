@@ -173,7 +173,6 @@ class RenderingState:
 class DiffSim:
     contacts_per_track = 3
     use_flippers = True
-    dt = 0.0005
     ke = 1.0e3
     kd = 150.0
     kf = 0.5
@@ -199,10 +198,11 @@ class DiffSim:
 
     rendering_state = None
 
-    def __init__(self, torch_hms, res, use_renderer=False, device="cpu"):
+    def __init__(self, torch_hms, res, dt=0.001, use_renderer=False, device="cpu"):
         # instantiate a tracked robot model consisting of a box and collision points
         self.sim_robots = len(torch_hms)  # number of simulated robots is based on number of heightmaps
         self.vis_robots = min(self.sim_robots, 4)
+        self.dt = dt
 
         self.device = device
         self.model, self.contact_points_single, self.flipper_centers, self.flipper_ids = build_track_sim(self.sim_robots, self.vis_robots, self.contacts_per_track, device)

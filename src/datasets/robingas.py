@@ -516,6 +516,7 @@ class RobinGas(RobinGasBase):
                  lss_cfg,
                  dphys_cfg=DPhysConfig(),
                  T_horizon=10.0,
+                 dt=0.001,
                  is_train=False,
                  only_front_cam=False):
         super(RobinGas, self).__init__(path, dphys_cfg)
@@ -528,6 +529,7 @@ class RobinGas(RobinGasBase):
         self.img_augs = self.get_img_augs()
 
         self.T_horizon = T_horizon
+        self.dt = dt
 
     def get_img_augs(self):
         if self.is_train:
@@ -844,7 +846,7 @@ class RobinGas(RobinGasBase):
         imgs, rots, trans, intrins, post_rots, post_trans = self.get_images_data(i)
         hm_geom = self.get_geom_height_map(i)
 
-        T_horizon, dt = self.T_horizon, 0.001
+        T_horizon, dt = self.T_horizon, self.dt
         pose_stamps, poses = self.get_traj(i, T_horizon=T_horizon, xyz_quat=True)
         control_stamps, controls = self.get_track_vels(i, T_horizon=T_horizon, dt=dt)
 
@@ -857,7 +859,7 @@ class RobinGas(RobinGasBase):
                 timestamps, poses, controls)
 
 
-def compile_data(seq_i=None, robot='tradr', T_horizon=10., small=False, is_train=False):
+def compile_data(seq_i=None, robot='tradr', T_horizon=10., dt=0.001, small=False, is_train=False):
     dphys_cfg = DPhysConfig()
     dphys_cfg_path = os.path.join(data_dir, '../config/dphys_cfg.yaml')
     assert os.path.isfile(dphys_cfg_path), 'Config file %s does not exist' % dphys_cfg_path
@@ -872,8 +874,8 @@ def compile_data(seq_i=None, robot='tradr', T_horizon=10., small=False, is_train
     else:
         path = np.random.choice(robingas_seq_paths[robot])
 
-    ds = RobinGas(path=path, dphys_cfg=dphys_cfg, lss_cfg=lss_cfg, T_horizon=T_horizon, is_train=is_train)
+    ds = RobinGas(path=path, dphys_cfg=dphys_cfg, lss_cfg=lss_cfg, T_horizon=T_horizon, dt=dt, is_train=is_train)
     if small:
-        ds = ds[np.random.choice(len(ds), 32, replace=False)]
+        ds = ds[np.random.choice(len(ds), 4, replace=False)]
 
     return ds
