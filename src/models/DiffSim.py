@@ -173,7 +173,7 @@ class RenderingState:
 class DiffSim:
     contacts_per_track = 3
     use_flippers = True
-    dt = 0.001
+    dt = 0.0005
     ke = 1.0e3
     kd = 150.0
     kf = 0.5
@@ -395,9 +395,7 @@ class DiffSim:
                     with tape:  # start recording all kernel calls
                         for shoot_t in range(self.T_s - 1):
                             self.simulate_flippers_heightmap(shoot_t)
-                        print('compute loss')
                         self.compute_l2_loss()  # given the simulated trajectories, compute the l2 loss
-                    print('backward')
                     tape.backward(loss=self.loss)  # propagate gradients into heightmaps
                     tape.zero()  # zero out all variable gradients (except for the heightmaps for some reason...)
                     tape.reset()  # reset tape
@@ -414,9 +412,7 @@ class DiffSim:
             with tape:  # start recording all kernel calls
                 for shoot_t in range(self.T_s - 1):
                     self.simulate_flippers_heightmap(shoot_t)
-                print('compute loss')
                 self.compute_l2_loss()  # given the simulated trajectories, compute the l2 loss
-            print('backward')
             tape.backward(loss=self.loss)  # propagate gradients into heightmaps
             tape.zero()  # zero out all variable gradients (except for the heightmaps for some reason...)
             tape.reset()  # reset tape

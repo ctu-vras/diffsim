@@ -9,13 +9,12 @@ from src.models.DiffSim import DiffSim
 wp.init()  # init warp!
 
 num_robots = 1
-device = "cpu"
+device = "cuda"
 use_cuda_graph = False
 
 # setup heigtmaps for the simulator using torch tensors
 shp = (30, 20)
 torch_hm = [torch.zeros(shp, dtype=torch.float32, device=device, requires_grad=True) for _ in range(num_robots)]
-torch_kf = [torch.tensor(0.5 * np.ones(shp), dtype=torch.float32, device=device, requires_grad=True) for _ in range(num_robots)]
 res = [0.2 for _ in range(num_robots)]  # heightmap resolutions
 
 # instantiate simulator and set the simulated time horizon

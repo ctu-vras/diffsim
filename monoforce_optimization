@@ -1,21 +1,21 @@
 #! /usr/bin/env python
 
+import os
 import torch
 import warp as wp
 import numpy as np
-import os
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 from src.config import DPhysConfig
 from src.utils import read_yaml, denormalize_img, ego_to_cam, get_only_in_img_mask
 from src.datasets.robingas import compile_data
-from src.models.DiffSim import DiffSim
 from src.models.TerrainEncoder import compile_model
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from datetime import datetime
-
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+from src.models.DiffSim import DiffSim
+
 wp.init()  # init warp!
 
 
@@ -29,9 +29,11 @@ class Learner:
                  lss_weights_path=None,
                  dphys_cfg_path='config/dphys_cfg.yaml',
                  T_horizon=10.0,
-                 device='cpu', use_renderer=False):
+                 device='cpu',
+                 use_renderer=False,
+                 use_cuda_graph=False):
         self.device = device
-        self.use_cuda_graph = True if device == 'cuda' else False
+        self.use_cuda_graph = use_cuda_graph
         self.use_renderer = use_renderer
         self.batch_size = batch_size
         self.T_horizon = T_horizon
@@ -54,7 +56,7 @@ class Learner:
         self.counter = 0
 
     def init_dataloader(self, **kwargs):
-        ds = compile_data(robot='tradr', T_horizon=self.T_horizon)
+        ds = compile_data(seq_i=2, robot='tradr', T_horizon=self.T_horizon)
         print('Dataset size:', len(ds))
         data_loader = DataLoader(ds, **kwargs)
         return data_loader
@@ -115,8 +117,6 @@ class Learner:
         # predict heightmaps
         height_pred = self.terrain_encoder(*imgs_data).squeeze(1)
         assert height_pred.shape == hm_geom[:, 0].shape, 'Height prediction and ground truth must have the same shape'
-        if torch.any(torch.isnan(height_pred)):
-            print('Height prediction contains NaNs')
 
         # dphysics trajectory loss
         loss_traj = self.traj_loss(height_pred)
@@ -126,15 +126,13 @@ class Learner:
         # geometry heightmap loss
         loss_geom = self.geom_hm_loss(height_gt=hm_geom[:, 0], height_pred=height_pred, weights=hm_geom[:, 1])
 
-        # total loss
-        loss = loss_geom + loss_traj
-        # print(f'Loss: {loss.item()}')
-        # print(f'Loss traj: {loss_traj.item()}')
-        # print(f'Loss geom: {loss_geom.item()}')
+        print(f'Loss traj: {loss_traj.item()}')
+        print(f'Loss geom: {loss_geom.item()}')
+        print('HM grad mean:', height_pred.grad.abs().mean().item())
 
         self.tb_writer.add_scalar('loss/traj', loss_traj, self.counter)
         self.tb_writer.add_scalar('loss/geom', loss_geom, self.counter)
-        self.tb_writer.add_scalar('loss/total', loss, self.counter)
+        self.tb_writer.add_scalar('loss/total', loss_traj + loss_geom, self.counter)
 
         if backprop:
             height_pred.backward(height_pred.grad, retain_graph=True)
@@ -145,7 +143,7 @@ class Learner:
             # necessary, since tape.zero() does not reach the torch tensor for some reason
             self.optimizer.zero_grad(set_to_none=False)
 
-        return loss
+        return loss_traj, loss_geom
 
     def vis_pred(self, batch):
         fig = plt.figure(figsize=(20, 12))
@@ -219,9 +217,7 @@ class Learner:
         (imgs, rots, trans, intrins, post_rots, post_trans,
          hm_geom,
          timestamps, poses, controls) = batch
-
-        controls = controls.transpose(1, 0)  # [B, T, C] -> [T, B, C]
-        flipper_angles = torch.zeros((controls.shape[0], self.batch_size, 4))
+        flipper_angles = torch.zeros((controls.shape[1], self.batch_size, 4))
         poses[:, :, 2] += 1.0  # add height offset
 
         self.dphys.set_T(T=int(1000 * self.T_horizon), T_s=300)
@@ -237,10 +233,10 @@ class Learner:
             with torch.no_grad():
                 batch = next(iter(self.data_loader))
 
-                # show front image
-                img = denormalize_img(batch[0][0, 0, :3])
-                plt.imshow(img)
-                plt.show()
+                # # show front image
+                # img = denormalize_img(batch[0][0, 0, :3])
+                # plt.imshow(img)
+                # plt.show()
 
                 # show control sequence
                 self.set_poses_and_controls(batch)
@@ -253,14 +249,12 @@ class Learner:
     def learn_sample(self, n_iters=1000, n_vis_steps=10):
         batch = next(iter(self.data_loader))
         self.set_poses_and_controls(batch)
+        self.dphys.init_shoot_states()  # load initial states for the shooter
 
         for _ in tqdm(range(n_iters)):
-            self.dphys.init_shoot_states()  # load initial states for the shooter
-
-            loss = self.step(batch)
+            self.step(batch)
 
             if self.counter % n_vis_steps == 0:
-                print(f'Loss: {loss.item()}')
                 fig = self.vis_pred(batch)
                 self.tb_writer.add_figure('train/prediction', fig, self.counter)
                 self.tb_writer.flush()
@@ -275,12 +269,12 @@ class Learner:
             self.counter += 1
 
     def epoch(self, n_vis_steps=10):
+
         for batch in tqdm(self.data_loader):
             self.set_poses_and_controls(batch)
-
             self.dphys.init_shoot_states()  # load initial states for the shooter
 
-            loss = self.step(batch, backprop=True)
+            loss_traj, loss_geom = self.step(batch)
 
             if self.counter % n_vis_steps == 0:
                 fig = self.vis_pred(batch)

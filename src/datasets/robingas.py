@@ -8,14 +8,13 @@ from scipy.spatial.transform import Rotation
 from skimage.draw import polygon
 from torch.utils.data import Dataset
 from ..utils import img_transform, normalize_img, ego_to_cam, get_only_in_img_mask, sample_augmentation, timing
-from ..utils import position, normalize, load_calib, read_yaml
+from ..utils import position, load_calib, read_yaml
 from ..config import DPhysConfig
 from .coco import COCO_CATEGORIES
 from ..transforms import interpolate_poses
 import cv2
 import albumentations as A
 from PIL import Image
-import open3d as o3d
 
 
 __all__ = [
@@ -652,7 +651,7 @@ class RobinGas(RobinGasBase):
         seg = transform(seg)
         return seg
     
-    def get_semantic_cloud(self, i, classes=None, vis=False, points_source='lidar'):
+    def get_semantic_cloud(self, i, classes=None, points_source='lidar'):
         coco_classes = [i['name'].replace('-merged', '').replace('-other', '') for i in COCO_CATEGORIES] + ['void']
         if classes is None:
             classes = np.copy(coco_classes)
@@ -698,13 +697,6 @@ class RobinGas(RobinGasBase):
         mask = np.isin(labels, selected_labels)
         points = points[mask]
         colors = colors[mask]
-
-        if vis:
-            colors = normalize(colors)
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(points)
-            pcd.colors = o3d.utility.Vector3dVector(colors)
-            o3d.visualization.draw_geometries([pcd])
 
         return points, colors
 
@@ -777,7 +769,7 @@ class RobinGas(RobinGasBase):
                 hm_rigid = np.load(file_path, allow_pickle=True).item()
             else:
                 seg_points, _ = self.get_semantic_cloud(i, classes=self.lss_cfg['obstacle_classes'],
-                                                        points_source=points_source, vis=False)
+                                                        points_source=points_source)
                 traj_points = self.get_footprint_traj_points(i)
                 points = np.concatenate((seg_points, traj_points), axis=0)
                 hm_rigid = self.estimate_heightmap(points, robot_radius=None)
@@ -852,7 +844,7 @@ class RobinGas(RobinGasBase):
         imgs, rots, trans, intrins, post_rots, post_trans = self.get_images_data(i)
         hm_geom = self.get_geom_height_map(i)
 
-        T_horizon, dt = self.T_horizon, 1e-3
+        T_horizon, dt = self.T_horizon, 0.001
         pose_stamps, poses = self.get_traj(i, T_horizon=T_horizon, xyz_quat=True)
         control_stamps, controls = self.get_track_vels(i, T_horizon=T_horizon, dt=dt)
 

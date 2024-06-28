@@ -67,8 +67,3 @@ class DPhysConfig:
 
         for k, v in params.items():
             setattr(self, k, v)
-
-
-if __name__ == '__main__':
-    cfg = DPhysConfig()
-    cfg.to_yaml('../../config/dphys_cfg.yaml')
