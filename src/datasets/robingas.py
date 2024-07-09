@@ -6,7 +6,7 @@ import torchvision
 from scipy.interpolate import griddata
 from scipy.spatial.transform import Rotation
 from skimage.draw import polygon
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, ConcatDataset, Subset
 from ..utils import img_transform, normalize_img, ego_to_cam, get_only_in_img_mask, sample_augmentation, timing
 from ..utils import position, load_calib, read_yaml
 from ..config import DPhysConfig
@@ -859,7 +859,21 @@ class RobinGas(RobinGasBase):
                 timestamps, poses, controls)
 
 
-def compile_data(seq_i=None, robot='tradr', T_horizon=10., dt=0.001, small=False, is_train=False):
+def compile_data(robot='tradr', T_horizon=10., dt=0.001, small=False, val_frac=0.1, seed=42):
+    """
+    Compile the dataset from multiple paths for the given robot.
+    :param robot: robot name
+    :param T_horizon: trajectory horizon
+    :param dt: time step
+    :param small: if True, use small datasets
+    :param val_frac: fraction of the dataset to use for validation
+    :param seed: random seed
+    :return: train and validation datasets
+    """
+    # set random seed
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
     dphys_cfg = DPhysConfig()
     dphys_cfg_path = os.path.join(data_dir, '../config/dphys_cfg.yaml')
     assert os.path.isfile(dphys_cfg_path), 'Config file %s does not exist' % dphys_cfg_path
@@ -869,13 +883,36 @@ def compile_data(seq_i=None, robot='tradr', T_horizon=10., dt=0.001, small=False
     assert os.path.isfile(lss_cfg_path)
     lss_cfg = read_yaml(lss_cfg_path)
 
-    if seq_i is not None:
-        path = robingas_seq_paths[robot][seq_i]
-    else:
-        path = np.random.choice(robingas_seq_paths[robot])
+    train_datasets, val_datasets = [], []
+    for path in robingas_seq_paths[robot]:
+        train_ds = RobinGas(path=path, dphys_cfg=dphys_cfg, lss_cfg=lss_cfg, T_horizon=T_horizon, dt=dt, is_train=True)
+        val_ds = RobinGas(path=path, dphys_cfg=dphys_cfg, lss_cfg=lss_cfg, T_horizon=T_horizon, dt=dt, is_train=False)
 
-    ds = RobinGas(path=path, dphys_cfg=dphys_cfg, lss_cfg=lss_cfg, T_horizon=T_horizon, dt=dt, is_train=is_train)
+        # randomly select a subset of the dataset
+        val_ds_size = int(val_frac * len(train_ds))
+        val_ids = np.random.choice(len(train_ds), val_ds_size, replace=False)
+        train_ids = np.setdiff1d(np.arange(len(train_ds)), val_ids)
+        assert len(train_ids) + len(val_ids) == len(train_ds)
+        # check that there is no overlap between train and val ids
+        assert len(np.intersect1d(train_ids, val_ids)) == 0
+
+        train_ds = Subset(train_ds, train_ids)
+        val_ds = Subset(val_ds, val_ids)
+        print(f'Train dataset from path {path} size is {len(train_ds)}')
+        print(f'Validation dataset from path {path} size is {len(val_ds)}')
+
+        train_datasets.append(train_ds)
+        val_datasets.append(val_ds)
+
+    train_ds = ConcatDataset(train_datasets)
+    val_ds = ConcatDataset(val_datasets)
+
     if small:
-        ds = ds[np.random.choice(len(ds), 4, replace=False)]
+        print('Using small datasets')
+        train_ds = Subset(train_ds, np.random.choice(len(train_ds), min(32, len(train_ds)), replace=False))
+        val_ds = Subset(val_ds, np.random.choice(len(val_ds), min(8, len(val_ds)), replace=False))
 
-    return ds
+    print(f'Train dataset size is {len(train_ds)}')
+    print(f'Validation dataset size is {len(val_ds)}')
+
+    return train_ds, val_ds
