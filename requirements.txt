@@ -1,0 +1,4 @@
+warp-lang==1.0.1
+numpy
+scipy
+pyglet
